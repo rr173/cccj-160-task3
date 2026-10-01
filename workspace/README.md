@@ -18,6 +18,12 @@
 - **分批放量**：已审核构件可建立带权重的放量批次，调用方携带 `routing_key`，
   系统用稳定散列决定走当前构件还是候选构件；批次代次不变时同键路由不漂移。
   批次支持升档 / 冻结 / 恢复 / 完成 / 撤销，全部以 `expected_generation` 做 CAS。
+- **自动止损**：业务方为一次试投配置滚动观察窗口、最小样本量与失败占比上限，
+  用 `request_id + feedback_id` 回报生产推理成败。只有"真实由该试投产生、命中
+  候选构件、当前代次、窗口内"的回执入账（同一 feedback_id / request_id 仅一次）；
+  重复、旧代次、基线/无关、迟到回执只写审计、不触发状态变化。窗口样本达门槛且
+  失败占比严格越界时，**单事务**冻结批次、新流量回落基线并保存触发快照；
+  并发越界只触发一次。人工恢复开启新代次并重置统计窗口，旧窗口与历史请求保留复核。
 
 ## 运行
 
@@ -28,7 +34,8 @@ python3 -m promptgov
 ```
 
 首启自动建表并灌入演示数据：模板族 `support-router`，线上 v1，候选
-v1.1.0（已建 20% 权重放量批次）、v1.2.0（扩大了 `refund.execute`，缺专项审批，
+v1.1.0（已建 20% 权重放量批次，并配置止损：1 小时窗口 / 最小样本 10 / 失败上限 30%，
+已入账 8 成功 2 失败，批次仍放量）、v1.2.0（扩大了 `refund.execute`，缺专项审批，
 建放量批次与发布都会被门禁拦下）、v1.3.0（绑定弱模型 mini，评估 0.5 不达标）。
 
 ## 分批放量
@@ -52,6 +59,47 @@ v1.1.0（已建 20% 权重放量批次）、v1.2.0（扩大了 `refund.execute`�
   任何失败或冲突都回滚，不改变已生效路由表；原有一步切换接口
   （promote/rollback）继续工作。
 
+## 自动止损（生产推理效果回执）
+
+- **配置**：`stoploss_configs` 每批次一份——`window_seconds`（滚动观察窗口，秒，
+  按请求**产生时间**计）、`min_sample`（最小样本量）、`fail_ratio_limit`（失败占比
+  上限，[0,1]，**严格越过**才触发；0 表示任何失败都越界）。窗口开启后（已有入账
+  回执）门槛冻结，改配需先人工恢复开新窗，避免窗口中途移动球门。
+- **回执入账**：`POST /api/rollouts/{rid}/feedback {feedback_id, request_id, outcome}`。
+  全部判定在单个 `BEGIN IMMEDIATE` 事务内，写入天然串行化：
+  1. 同一 `feedback_id` 全局唯一（主键，先于一切校验，重试安全）→ 重复返回 **409**；
+  2. 请求必须存在（404）、且 `requests.rollout_id` 等于本批次，否则 `unrelated_request`；
+  3. 同一 `request_id` 只能入账一次 → 重复返回 **409**；
+  4. 请求实际命中版本必须是候选构件，否则 `hit_baseline`；
+  5. 命中代次必须等于批次**当前代次**，否则 `stale_generation`（冻结/升档/止损前的
+     旧请求只留审计）；
+  6. 批次必须仍在 `ramping`；自动止损冻结后为 `stoploss_tripped`；
+  7. 批次必须已配置止损（否则 `stoploss_not_configured`）；
+  8. 请求产生时间必须在滚动窗口内，否则 `late_receipt`。
+  
+  2–8 为业务拒绝：HTTP 200 + `credited=false` + `reject_reason`，**只写 `audit_log`，
+  绝不改变任何状态**；1/3 为幂等冲突 409。冻结期（含止损）产生的调用仍固化
+  `rollout_id/rollout_generation`（命中基线），因此其回执能与"完全无关请求"区分。
+- **滚动窗口统计**：仅统计 `request_created_at ∈ [t-window, t]` 的入账回执
+  （`t` = 当前回执对应请求的产生时间，用 SQLite `datetime(...,'-N seconds')`）。
+  迟到回执按真实产生时刻落入或落在窗口外；窗口前的旧回执不影响当前判定。
+- **触发（单事务）**：窗口内 `total ≥ min_sample` 且 `fails/total > limit` 时，
+  同一事务内：批次 `ramping → frozen`、`stoploss_tripped=1`、`generation+1`，
+  窗口 `active → tripped`，写 `stoploss_triggers` 快照（样本/失败/占比、候选与基线
+  构件、权重、代次、触发回执 id、路由处置）。路由层对 `frozen` 的既有语义即
+  "所有新流量（含本应命中候选的 key）回落基线"，无需移动线上指针。
+- **并发只触发一次**：写锁串行 + `UPDATE ... WHERE status='ramping'` 行守卫；
+  后到事务看到 frozen，回执走 `stoploss_tripped` 审计路径，快照只有一个、代次只 +1。
+- **人工恢复**：`POST /api/rollouts/{rid}/recover {expected_generation}` 仅对
+  止损冻结生效（普通手动冻结走 resume）。单事务 CAS 回 `ramping`、清标记、
+  代次 +1、关闭 `tripped` 窗并按当前配置开 `seq+1` 新窗（计数清零）；权重不变，
+  恢复后同 key 路由与冻结前一致。旧窗口、触发快照、入账回执与 `requests`
+  全部保留，调用详情页（replay）与止损历史页可持续复核。
+- **页面**：`/rollouts/{rid}/stoploss` 止损配置、实时窗口统计、人工恢复、
+  触发快照、窗口历史、被拒回执审计流、入账回执明细（链到调用详情）；
+  `/requests/{id}/replay` 增加回执面板（归属/代次/配置状态、报告成功或失败、
+  已入账回执展示）。
+
 ## 关键不变量与实现
 
 | 需求 | 实现 |
@@ -65,6 +113,11 @@ v1.1.0（已建 20% 权重放量批次）、v1.2.0（扩大了 `refund.execute`�
 | 旧请求可复核 | `requests` 行固化版本/模型/输入摘要/模板哈希/输出摘要；重演读版本快照而非当前指针 |
 | 放量同键稳定 | 路由桶号只依赖 `(rollout_id, routing_key)` 的稳定散列，不含权重/代次 |
 | 放量并发只一胜 | 批次切换带 `expected_generation` 做代次 CAS，冲突 409 且路由表不变 |
+| 回执唯一入账 | `feedback_receipts.feedback_id` 主键（全局）+ `request_id UNIQUE`；重复 409，仅审计 |
+| 回执归属 | 必须 `requests.rollout_id` 匹配且命中候选、命中代次==当前代次、窗口内；其余只留审计 |
+| 越界只触发一次 | 回执/触发在同一 `BEGIN IMMEDIATE` 事务；`UPDATE...WHERE status='ramping'` 行守卫，并发只一胜 |
+| 止损单事务 | 冻结批次+代次+1+窗口 tripped+`stoploss_triggers` 快照同事务；frozen 语义即流量回落基线 |
+| 恢复开窗重置 | 人工恢复 CAS 回 ramping、代次+1、旧窗 tripped 保留、新窗 seq+1 计数清零；历史请求仍可重演 |
 | 调用可复查 | `requests` 固化命中构件/推理配置/参数指纹/批次代次；复查不读当前批次状态 |
 | 权限扩大重新审批 | 相对线上基线新增工具即要求覆盖该工具集的 `tool_expansion` approved；回滚只收窄故免新审批 |
 | 契约升级分级 | 删变量/加必填/改类型=breaking；仅加可选变量=compatible；网关按声明字段投影输入 |
@@ -81,9 +134,11 @@ v1.1.0（已建 20% 权重放量批次）、v1.2.0（扩大了 `refund.execute`�
 - `/` 总览：模板族/线上版本（含放量中标记）、模型注册表、审计流。
 - `/families/{id}` 版本治理：建版本（四要素）、热发布/回滚、线上调用（可带 routing_key）、最近请求。
 - `/families/{id}/rollout` **放量操作页**：建批次、升档/冻结/恢复/完成/撤销、批次历史、最近命中。
+- `/rollouts/{id}/stoploss` **自动止损页**：止损配置、实时窗口统计、人工恢复、
+  触发快照、统计窗口历史、被拒回执审计流、入账回执明细。
 - `/versions/{id}/eval` **评估页面**：证据列表（含迟到标记）、逐用例渲染提示与输出、审批。
 - `/requests/{id}/replay` **调用复查页**：原三元组与放量命中证据（命中构件/批次代次/参数指纹/
-  推理配置快照）、精确重演、单轴反事实、漂移注入、历史重演记录与结论。
+  推理配置快照）、精确重演、单轴反事实、漂移注入、历史重演记录与结论、生产效果回执面板。
 
 ## JSON API（摘要）
 
@@ -104,6 +159,15 @@ POST /api/rollouts/{rid}/freeze              # {expected_generation} 冻结
 POST /api/rollouts/{rid}/resume              # {expected_generation} 恢复
 POST /api/rollouts/{rid}/complete            # {expected_generation} 完成（候选转正）
 POST /api/rollouts/{rid}/cancel              # {expected_generation} 撤销（流量回归）
+POST /api/rollouts/{rid}/stoploss/config     # {window_seconds,min_sample,fail_ratio_limit}
+GET  /api/rollouts/{rid}/stoploss/config
+GET  /api/rollouts/{rid}/stoploss            # 配置/窗口/统计/快照/回执聚合（历史页数据）
+POST /api/rollouts/{rid}/feedback            # {feedback_id,request_id,outcome} 效果回执
+POST /api/rollouts/{rid}/recover             # {expected_generation} 人工恢复（新代次+重置窗口）
+GET  /api/stoploss/triggers[?rollout=]       # 触发快照列表
+GET  /api/stoploss/triggers/{tid}            # 单个触发快照
+GET  /api/feedback[?rollout=&window=]        # 入账回执列表
+GET  /api/feedback/{feedback_id}             # 单条入账回执
 POST /api/versions/{vid}/eval/start
 POST /api/eval-runs/{rid}/run
 GET  /api/versions/{vid}/eval-runs
@@ -118,15 +182,20 @@ GET  /api/audit
 
 ## 代码地图
 
-- `db.py`：SQLite schema（含 `rollouts` 批次表与 `requests` 放量证据列）、WAL、
+- `db.py`：SQLite schema（含 `rollouts` 批次表、`requests` 放量证据列，以及
+  `stoploss_configs/windows/triggers/feedback_receipts` 止损四表）、WAL、
   `write_tx()` 立即写锁事务、审计、老库增量迁移。
 - `core.py`：内容/输入/输出哈希、参数指纹、放量稳定散列分桶、变量契约校验与升级分级、
   权限集合比较、受限渲染入口。
 - `jinja_compat.py`：零依赖沙箱模板（`{{ }}`、`{% if/for %}`、过滤器、比较/三元）。
 - `llm.py`：模型注册表 + 确定性假模型（输出由 model/template/input 三轴决定）+ 断言器。
 - `services.py`：版本生命周期、评估证据、审批、CAS 发布/回滚、分批放量
-  （建批门禁、代次 CAS 状态机、稳定散列路由）、调用、重演归因。
+  （建批门禁、代次 CAS 状态机、稳定散列路由）、调用、重演归因，以及自动止损
+  （配置、滚动窗口统计、回执入账判定、单事务触发冻结与快照、人工恢复开窗重置）。
 - `app.py`：HTTP 路由（JSON API + 服务端渲染页面）。
 - `seed.py`：幂等演示数据。
 - `tests/test_rollout.py`：放量机制端到端验证（同键稳定/按比例分流/并发升档/
   冻结/撤销/复查复现/专项授权/HTTP 冒烟），`python3 -m unittest discover -s tests`。
+- `tests/test_stoploss.py`：自动止损端到端验证——重复回执、阈值临界（等上限不触发/
+  样本不足不触发/严格越界触发）、20 路并发越界只触发一次、迟到回执、旧代次只审计、
+  无关/基线请求拒绝、人工恢复开窗重置与旧窗口复核、批次终结关窗、JSON API 与页面冒烟。

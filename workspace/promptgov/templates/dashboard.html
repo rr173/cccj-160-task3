@@ -17,7 +17,15 @@
               {% if f.rollout %}<div style="margin-top:4px">
                 <a href="/families/{{ f.family_id }}/rollout"><span class="chip warn">
                 放量 {{ f.rollout.weight }}% → v{{ f.rollout.candidate_semver }} ·
-                {{ f.rollout.status }}</span></a></div>{% endif %}
+                {{ f.rollout.status }}</span></a>
+                {% if f.rollout.is_tripped %}
+                <a href="/rollouts/{{ f.rollout.rollout_id }}/stoploss"><span class="chip"
+                   style="background:rgba(239,91,91,.15);color:var(--bad);border:1px solid rgba(239,91,91,.4)">
+                   ⛔ 自动止损</span></a>
+                {% else %}
+                <a href="/rollouts/{{ f.rollout.rollout_id }}/stoploss"><span class="chip">🛡 止损</span></a>
+                {% endif %}
+              </div>{% endif %}
             {% else %}<span class="mut">未发布（拒绝线上流量）</span>{% endif %}</td>
           <td>{{ f.n_versions }}</td>
           <td><a class="btn ghost" href="/families/{{ f.family_id }}">治理</a></td>

@@ -170,7 +170,9 @@ class RolloutLifecycleTest(unittest.TestCase):
         self.assertEqual(ro["status"], "frozen")
         hit = services.invoke(fid, INPUTS, "t", routing_key=key)
         self.assertEqual(hit["version_id"], v1, "冻结期间新调用必须走当前构件")
-        self.assertIsNone(hit["rollout_id"], "冻结期间的调用不记批次命中")
+        # 冻结期调用仍固化批次/代次（命中基线），以便回执识别归属；不记候选命中
+        self.assertIsNotNone(hit["rollout_id"], "冻结期调用应归属当前批次")
+        self.assertEqual(hit["rollout_generation"], ro["generation"])
         ro = services.resume_rollout(ro["rollout_id"], ro["generation"], "test")
         self.assertEqual(ro["status"], "ramping")
         self.assertEqual(services.invoke(fid, INPUTS, "t", routing_key=key)["version_id"],

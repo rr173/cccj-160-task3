@@ -11,6 +11,51 @@
   · 代次 <span class="mono small">{{ req.rollout_generation }}</span>。{% endif %}
 </div>
 
+{% if req.rollout_id %}
+<div class="card">
+  <h2>生产推理效果回执（自动止损）
+    <a class="chip" href="/rollouts/{{ req.rollout_id }}/stoploss">止损配置与历史 →</a>
+  </h2>
+  {% if feedback.feedback_id %}
+  <p>本请求已入账回执 <span class="mono">{{ feedback.feedback_id }}</span>：
+    {% if feedback.outcome == 'failure' %}<span class="badge b-failed_eval">failure</span>
+    {% else %}<span class="badge b-active">success</span>{% endif %}
+    · 入账时间 {{ feedback.credited_at }} · 窗口 <span class="mono small">{{ feedback.window_id }}</span></p>
+  <p class="small">同一 feedback_id 与同一 request_id 都只能入账一次，重复提交被拒绝（仅审计）。</p>
+  {% else %}
+  <p class="small">回执只对<b>真实由该试投产生、命中候选构件、属于当前批次代次</b>、
+    在观察窗口内的请求入账；基线请求、旧代次请求、迟到回执只留审计记录。</p>
+  <div class="kv">
+    <div>命中候选构件</div><div>{% if feedback.is_candidate_hit %}<span class="ok">是</span>
+      {% else %}<span class="bad">否（命中基线，回执不会入账）</span>{% endif %}</div>
+    <div>批次代次</div><div>命中 gen {{ feedback.hit_generation }} / 当前
+      gen {{ feedback.current_generation }}
+      {% if feedback.same_generation %}<span class="ok">一致</span>
+      {% else %}<span class="warn">不一致（旧代次请求，仅审计）</span>{% endif %}</div>
+    <div>批次状态</div><div>{{ feedback.rollout_status }}
+      {% if feedback.rollout_tripped %}<span class="badge b-failed_eval">已自动止损</span>{% endif %}</div>
+    <div>止损配置</div><div>{% if feedback.configured %}已配置
+      {% else %}<span class="warn">未配置（回执仅审计）</span>{% endif %}</div>
+  </div>
+  {% if feedback.can_report %}
+  <form method="post" action="/ui/rollouts/{{ feedback.rollout_id }}/feedback"
+        class="grid g3" style="grid-template-columns:2fr 1fr auto;margin-top:12px">
+    <input type="hidden" name="request_id" value="{{ req.request_id }}">
+    <input name="feedback_id" placeholder="feedback_id（业务方回执唯一标识）" required>
+    <select name="outcome">
+      <option value="success">success 成功</option>
+      <option value="failure">failure 失败</option>
+    </select>
+    <button>提交回执</button>
+  </form>
+  {% else %}
+  <p class="small warn" style="margin-top:8px">当前不可提交入账回执（批次非放量态 / 未配置止损 /
+    命中基线或旧代次）；提交也只会写入审计日志，不触发状态变化。</p>
+  {% endif %}
+  {% endif %}
+</div>
+{% endif %}
+
 {% if result %}
 <div class="card">
   <h2>重演报告</h2>

@@ -12,8 +12,10 @@
 {% if current %}
 <div class="card">
   <h2>进行中的批次
-    {% if current.is_ramping %}<span class="badge b-evaluating">ramping 放量中</span>{% endif %}
-    {% if current.is_frozen %}<span class="badge b-approved">frozen 已冻结</span>{% endif %}
+    {% if current.is_tripped %}<span class="badge b-failed_eval">⛔ frozen · 自动止损触发</span>
+    {% elif current.is_ramping %}<span class="badge b-evaluating">ramping 放量中</span>{% endif %}
+    {% if current.is_frozen %}{% if current.is_tripped %}{% else %}<span class="badge b-approved">frozen 已冻结</span>{% endif %}{% endif %}
+    <a class="chip" href="/rollouts/{{ current.rollout_id }}/stoploss">🛡 止损配置与历史 →</a>
   </h2>
   <div class="kv">
     <div>rollout_id</div><div class="mono">{{ current.rollout_id }}</div>
@@ -23,9 +25,27 @@
       <span class="mono small">{{ current.base_version_id }}</span></div>
     <div>分流权重</div><div><b>{{ current.weight }}%</b> 的 key 走候选，其余走当前构件</div>
     <div>批次代次</div><div class="mono">{{ current.generation }}</div>
+    {% if current.stoploss_cfg %}
+    <div>止损配置</div><div>{{ current.stoploss_cfg.window_seconds }}s 滚动窗口 ·
+      最小样本 {{ current.stoploss_cfg.min_sample }} · 失败上限
+      <span class="mono">{{ current.stoploss_cfg.fail_ratio_limit }}</span></div>
+    {% else %}
+    <div>止损配置</div><div class="warn">尚未配置 ——
+      <a href="/rollouts/{{ current.rollout_id }}/stoploss">立即配置观察窗口/样本门槛/失败上限</a></div>
+    {% endif %}
     <div>创建</div><div>{{ current.created_at }} · {{ current.created_by }}</div>
   </div>
 
+  {% if current.is_tripped %}
+  <div class="flash" style="margin-top:14px">
+    ⛔ 本批次被<b>自动止损</b>冻结：越界回执在单事务内冻结了试投，新流量（含本应命中候选的
+    routing_key）已全部回落基线 v{{ current.base_semver }}。普通恢复被禁止——请到
+    <a href="/rollouts/{{ current.rollout_id }}/stoploss">止损页</a>
+    查看触发快照并执行<b>人工恢复</b>（开启新代次 + 重置统计窗口）。
+  </div>
+  {% endif %}
+
+  {% if current.is_tripped %}{% else %}
   <div class="grid g3" style="margin-top:14px">
     {% if current.is_ramping %}
     <form method="post" action="/ui/rollouts/{{ current.rollout_id }}/ramp">
@@ -62,6 +82,7 @@
       <button class="danger">撤销批次</button>
     </form>
   </div>
+  {% endif %}
 </div>
 {% else %}
 <div class="card">
@@ -95,15 +116,17 @@
   <div class="card">
     <h2>批次历史</h2>
     <table>
-      <thead><tr><th>rollout_id</th><th>候选 → 基线</th><th>权重</th><th>状态</th><th>代次</th><th>更新</th></tr></thead>
+      <thead><tr><th>rollout_id</th><th>候选 → 基线</th><th>权重</th><th>状态</th><th>代次</th><th>止损</th><th>更新</th></tr></thead>
       <tbody>
       {% for r in rollouts %}
         <tr>
           <td class="small mono">{{ r.rollout_id }}</td>
           <td class="small">v{{ r.candidate_semver }} → v{{ r.base_semver }}</td>
           <td class="small">{{ r.weight }}%</td>
-          <td><span class="badge b-{{ r.status }}">{{ r.status }}</span></td>
+          <td><span class="badge b-{{ r.status }}">{{ r.status }}</span>
+            {% if r.is_tripped %}<span class="badge b-failed_eval">止损触发</span>{% endif %}</td>
           <td class="small mono">{{ r.generation }}</td>
+          <td><a href="/rollouts/{{ r.rollout_id }}/stoploss">配置 / 历史</a></td>
           <td class="small">{{ r.updated_at }}</td>
         </tr>
       {% endfor %}

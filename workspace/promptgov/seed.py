@@ -99,10 +99,33 @@ def run() -> None:
 
     # 分批放量演示：v2（已审核、权限未扩大）建立 20% 权重批次；
     # 两笔带 routing_key 的线上调用，固化命中构件/批次代次/参数指纹
-    services.create_rollout(FAMILY, v2["version_id"], 20, actor)
+    ro = services.create_rollout(FAMILY, v2["version_id"], 20, actor)
     services.invoke(FAMILY, ONLINE_INPUTS, actor, routing_key="user-10086")
     services.invoke(FAMILY, ONLINE_INPUTS, actor, routing_key="user-20431")
 
+    # 自动止损演示：1 小时滚动窗口、最小样本 10、失败占比上限 30%；
+    # 灌入若干命中候选的请求，报告 8 成功 / 2 失败（样本 10 达门槛，20% 未越界，
+    # 批次仍在放量、统计窗口 live）。回执去重与拒绝场景见测试与止损历史页。
+    from . import core
+    services.configure_stoploss(ro["rollout_id"], 3600, 10, 0.30, actor)
+    hit_keys = []
+    i = 0
+    while len(hit_keys) < 10:
+        key = f"trial-user-{i}"
+        if core.stable_bucket(ro["rollout_id"], key) < ro["weight"]:
+            hit_keys.append(key)
+        i += 1
+    demo_reqs = []
+    for idx, key in enumerate(hit_keys):
+        res = services.invoke(FAMILY, ONLINE_INPUTS, actor,
+                              request_id=f"seed-demo-req-{idx:02d}", routing_key=key)
+        demo_reqs.append(res)
+    for idx, res in enumerate(demo_reqs):
+        outcome = "failure" if idx < 2 else "success"
+        services.report_feedback(ro["rollout_id"], f"seed-demo-fb-{idx:02d}",
+                                 res["request_id"], outcome, actor)
+
     conn.commit()
-    print("[seed] 演示数据就绪：family=%s 线上=v1，候选 v2（20%% 放量中）、v3（需工具权限审批）、"
+    print("[seed] 演示数据就绪：family=%s 线上=v1，候选 v2（20%% 放量中，止损 3600s/"
+          "n≥10/失败≤30%%，已入账 8 成功 2 失败）、v3（需工具权限审批）、"
           "v4（弱模型证据）" % FAMILY)

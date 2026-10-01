@@ -648,13 +648,21 @@ def freeze_rollout(rollout_id: str, expected_generation: int, actor: str) -> dic
 
 
 def resume_rollout(rollout_id: str, expected_generation: int, actor: str) -> dict:
-    """恢复：冻结批次回到放量态，权重不变（同 key 路由决定与冻结前一致）。"""
+    """恢复：冻结批次回到放量态，权重不变（同 key 路由决定与冻结前一致）。
+
+    自动止损触发的冻结不能走普通恢复：必须走人工恢复（recover_rollout），
+    后者会开启新代次并重置统计窗口，同时保留旧窗口供复核。
+    """
     with write_tx() as c:
         r = c.execute("SELECT * FROM rollouts WHERE rollout_id=?", (rollout_id,)).fetchone()
         if not r:
             raise NotFound(f"放量批次不存在: {rollout_id}")
         if r["status"] != "frozen":
             raise Conflict(f"批次当前状态为 {r['status']}，仅已冻结批次可恢复")
+        if r["stoploss_tripped"]:
+            raise Conflict(
+                "该冻结由自动止损触发，不能直接恢复：请使用人工恢复（recover）——"
+                "恢复会开启新代次并重置统计窗口，旧窗口保留复核")
         _cas_transition(c, rollout_id, expected_generation, "status='ramping'",
                         (), ("frozen",))
         audit(actor, "rollout.resume", "rollout", rollout_id,
@@ -687,6 +695,7 @@ def complete_rollout(rollout_id: str, expected_generation: int, actor: str) -> d
                   "WHERE version_id=?", (r["candidate_version_id"],))
         c.execute("UPDATE versions SET status='superseded' WHERE version_id=?",
                   (r["base_version_id"],))
+        _close_active_window(c, rollout_id, reason="rollout_completed")
         audit(actor, "rollout.complete", "rollout", rollout_id,
               f"候选转正 {r['base_version_id']} -> {r['candidate_version_id']}")
     return get_rollout(rollout_id)
@@ -702,9 +711,494 @@ def cancel_rollout(rollout_id: str, expected_generation: int, actor: str) -> dic
             raise Conflict("批次已终结，不可撤销")
         _cas_transition(c, rollout_id, expected_generation,
                         "status='cancelled'", (), ROLLOUT_OPEN)
+        _close_active_window(c, rollout_id, reason="rollout_cancelled")
         audit(actor, "rollout.cancel", "rollout", rollout_id,
               f"撤销放量，流量回归当前构件 {r['base_version_id']}")
     return get_rollout(rollout_id)
+
+
+# ================================================================ 自动止损
+
+FEEDBACK_OUTCOMES = ("success", "failure")
+
+
+class _ConcurrentTrip(Exception):
+    """本事务的冻结行守卫失败：批次已被并发越界回执抢先冻结。内部信号，触发整单重试，
+    重试会在最新状态下走到 stoploss_tripped 的只审计分支。"""
+
+
+def _semver(c, version_id: str) -> str:
+    row = c.execute("SELECT semver FROM versions WHERE version_id=?",
+                    (version_id,)).fetchone()
+    return row["semver"] if row else ""
+
+
+def _close_active_window(c, rollout_id: str, reason: str) -> None:
+    """关闭仍 active 的统计窗口（tripped 窗口保留其触发状态，不动）。
+
+    批次完成/撤销时调用；与批次状态切换在同一写事务内。
+    """
+    cur = c.execute(
+        "UPDATE stoploss_windows SET status='closed', closed_at=datetime('now') "
+        "WHERE rollout_id=? AND status='active'", (rollout_id,))
+    if cur.rowcount:
+        audit("system", "stoploss.window_closed", "stoploss_window", rollout_id, reason)
+
+
+# ---------------------------------------------------------------- 配置
+
+def configure_stoploss(rollout_id: str, window_seconds: int, min_sample: int,
+                       fail_ratio_limit: float, actor: str) -> dict:
+    """设置/更新试投的止损配置：观察窗口、最小样本量、失败占比上限。
+
+    统计窗口一旦开启（已有入账回执），当前窗口的判定门槛冻结为开窗时的配置快照；
+    为避免窗口中途移动门槛，此时拒绝改配——请先人工恢复重置窗口后再调整。
+    """
+    window_seconds = int(window_seconds)
+    min_sample = int(min_sample)
+    fail_ratio_limit = float(fail_ratio_limit)
+    if window_seconds <= 0:
+        raise DomainError("观察窗口必须是正整数秒")
+    if min_sample < 1:
+        raise DomainError("最小样本量必须 ≥ 1")
+    if not (0.0 <= fail_ratio_limit <= 1.0):
+        raise DomainError("失败占比上限必须在 [0, 1] 之间（0 = 任何失败都越界）")
+    with write_tx() as c:
+        r = c.execute("SELECT * FROM rollouts WHERE rollout_id=?", (rollout_id,)).fetchone()
+        if not r:
+            raise NotFound(f"放量批次不存在: {rollout_id}")
+        if r["status"] not in ROLLOUT_OPEN:
+            raise Conflict(f"批次已终结（{r['status']}），不能再配置止损")
+        w = c.execute("SELECT * FROM stoploss_windows WHERE rollout_id=? AND status='active'",
+                      (rollout_id,)).fetchone()
+        if w and c.execute(
+                "SELECT 1 FROM feedback_receipts WHERE window_id=? LIMIT 1",
+                (w["window_id"],)).fetchone():
+            raise Conflict(
+                "当前统计窗口已有入账回执，门槛已冻结；请先人工恢复（recover）开启新窗口后再改配")
+        exists = c.execute("SELECT 1 FROM stoploss_configs WHERE rollout_id=?",
+                           (rollout_id,)).fetchone()
+        if exists:
+            c.execute(
+                """UPDATE stoploss_configs SET window_seconds=?, min_sample=?,
+                   fail_ratio_limit=?, created_by=?, updated_at=datetime('now')
+                   WHERE rollout_id=?""",
+                (window_seconds, min_sample, fail_ratio_limit, actor, rollout_id))
+            action = "stoploss.config_update"
+        else:
+            c.execute(
+                """INSERT INTO stoploss_configs(rollout_id,window_seconds,min_sample,
+                   fail_ratio_limit,created_by) VALUES (?,?,?,?,?)""",
+                (rollout_id, window_seconds, min_sample, fail_ratio_limit, actor))
+            action = "stoploss.config_set"
+        audit(actor, action, "rollout", rollout_id,
+              f"window={window_seconds}s min_sample={min_sample} "
+              f"fail_ratio_limit={fail_ratio_limit:.2f}")
+    return get_stoploss_config(rollout_id)
+
+
+def get_stoploss_config(rollout_id: str) -> dict | None:
+    row = get_conn().execute("SELECT * FROM stoploss_configs WHERE rollout_id=?",
+                             (rollout_id,)).fetchone()
+    return dict(row) if row else None
+
+
+# ---------------------------------------------------------------- 窗口 / 统计
+
+def list_windows(rollout_id: str) -> list[dict]:
+    return [dict(r) for r in get_conn().execute(
+        "SELECT * FROM stoploss_windows WHERE rollout_id=? ORDER BY seq DESC",
+        (rollout_id,)).fetchall()]
+
+
+def _get_or_open_window(c, rollout_id: str, config_row) -> dict:
+    """取当前 active 窗口；不存在则按当前配置开窗（seq 在批次内递增）。"""
+    w = c.execute(
+        "SELECT * FROM stoploss_windows WHERE rollout_id=? AND status='active'",
+        (rollout_id,)).fetchone()
+    if w:
+        return dict(w)
+    last = c.execute("SELECT COALESCE(MAX(seq),0) AS m FROM stoploss_windows WHERE rollout_id=?",
+                     (rollout_id,)).fetchone()["m"]
+    window_id = _uid("win")
+    c.execute(
+        """INSERT INTO stoploss_windows(window_id,rollout_id,seq,status,window_seconds,
+           min_sample,fail_ratio_limit) VALUES (?,?,?, 'active',?,?,?)""",
+        (window_id, rollout_id, last + 1, config_row["window_seconds"],
+         config_row["min_sample"], config_row["fail_ratio_limit"]))
+    audit("system", "stoploss.window_open", "stoploss_window", window_id,
+          f"rollout={rollout_id} seq={last + 1} window={config_row['window_seconds']}s "
+          f"min_sample={config_row['min_sample']} limit={config_row['fail_ratio_limit']:.2f}")
+    return dict(c.execute("SELECT * FROM stoploss_windows WHERE window_id=?",
+                          (window_id,)).fetchone())
+
+
+def _window_stats(c, window_row: dict, at_request_created_at: str) -> dict:
+    """滚动窗口统计：仅统计请求产生时间在 [t-window_seconds, t] 内的入账回执。
+
+    以刚入账回执复制的 requests.created_at 为右端点，故"迟到回执"按其真实产生
+    时刻落入窗口参与计数；窗口前的旧回执自然被排除，不会改变当前判定。
+    """
+    row = c.execute(
+        """SELECT COUNT(*) AS total,
+                  COALESCE(SUM(CASE WHEN outcome='failure' THEN 1 ELSE 0 END),0) AS fails
+           FROM feedback_receipts
+           WHERE window_id=? AND request_created_at <= ?
+             AND request_created_at >= datetime(?, ?)""",
+        (window_row["window_id"], at_request_created_at, at_request_created_at,
+         f"-{int(window_row['window_seconds'])} seconds")).fetchone()
+    total, fails = int(row["total"]), int(row["fails"])
+    return {"total": total, "fails": fails,
+            "fail_ratio": (fails / total) if total else 0.0}
+
+
+def window_stats(rollout_id: str, window_id: str) -> dict:
+    """历史页用：以当前时刻为右端点的滚动窗口统计。"""
+    conn = get_conn()
+    w = conn.execute("SELECT * FROM stoploss_windows WHERE window_id=?",
+                     (window_id,)).fetchone()
+    if not w:
+        raise NotFound(f"统计窗口不存在: {window_id}")
+    return _window_stats(conn, dict(w), _db_now(conn))
+
+
+def _db_now(c) -> str:
+    return c.execute("SELECT datetime('now') AS t").fetchone()["t"]
+
+
+# ---------------------------------------------------------------- 回执入账 / 触发
+
+def report_feedback(rollout_id: str, feedback_id: str, request_id: str,
+                    outcome: str, actor: str) -> dict:
+    """报告一次生产推理效果回执，并在同一事务内完成自动止损判定。
+
+    入账前置（任一不满足则只写审计记录、不触发任何状态变化，HTTP 仍返回 200）：
+    1. request 存在且真实由该试投产生（requests.rollout_id 一致）；
+    2. 请求实际命中候选构件（version_id == 候选），基线/无关请求不入账；
+    3. 命中时批次代次 == 当前批次代次，旧代次（冻结/升档/止损前）只留审计；
+    4. 回执在配置的滚动观察窗口内（按请求产生时间），迟到回执只留审计；
+    5. 批次当前为 ramping（含自动止损冻结/完成/撤销均不再入账）；
+    6. 已配置止损参数。
+
+    硬冲突（409）：同一 feedback_id 重复回执；同一 request_id 重复入账。
+    触发：窗口内样本 ≥ min_sample 且 fail/total 严格大于 fail_ratio_limit 时，
+    在同一事务内冻结批次、新流量回落基线（路由层看到 frozen 即走基线）、保存快照。
+    """
+    feedback_id = str(feedback_id).strip()
+    request_id = str(request_id).strip()
+    if not feedback_id or not request_id:
+        raise DomainError("feedback_id 与 request_id 不能为空")
+    if outcome not in FEEDBACK_OUTCOMES:
+        raise DomainError("outcome 必须是 success 或 failure")
+
+    def _attempt():
+        with write_tx() as c:
+            # 幂等键优先：同一 feedback_id 全局只能入账一次。先于 request/rollout
+            # 查找，保证调用方拿同一 feedback_id 重试时始终得到一致的 409，且不改状态。
+            prev = c.execute("SELECT request_id,outcome,rollout_id FROM feedback_receipts "
+                             "WHERE feedback_id=?", (feedback_id,)).fetchone()
+            if prev:
+                audit(actor, "feedback.duplicate", "feedback", feedback_id,
+                      f"rollout={rollout_id} request={request_id} 已对 "
+                      f"rollout={prev['rollout_id']} request={prev['request_id']} "
+                      f"outcome={prev['outcome']} 入账，重复回执拒绝")
+                raise Conflict(f"feedback_id={feedback_id} 已入账（对应 request="
+                               f"{prev['request_id']}），同一回执只能入账一次")
+            req = c.execute("SELECT * FROM requests WHERE request_id=?",
+                            (request_id,)).fetchone()
+            if not req:
+                raise NotFound(f"请求不存在: {request_id}")
+            r = c.execute("SELECT * FROM rollouts WHERE rollout_id=?",
+                          (rollout_id,)).fetchone()
+            if not r:
+                raise NotFound(f"放量批次不存在: {rollout_id}")
+
+            def reject(reason: str, detail: str):
+                audit(actor, "feedback.reject", "feedback", feedback_id,
+                      f"rollout={rollout_id} request={request_id} outcome={outcome} "
+                      f"reason={reason} {detail}".strip())
+                return {"feedback_id": feedback_id, "rollout_id": rollout_id,
+                        "request_id": request_id, "outcome": outcome, "credited": False,
+                        "reject_reason": reason, "tripped": False}
+
+            # 1) 回执必须对应该试投真实产生的请求
+            if not req["rollout_id"]:
+                return reject("unrelated_request",
+                              f"请求未参与任何放量（hit={req['version_id']}）")
+            if req["rollout_id"] != rollout_id:
+                return reject("unrelated_request",
+                              f"请求属于另一批次 {req['rollout_id']}")
+            # 同一 request_id 在同一批次只能入账一次（紧跟归属校验之后：即便批次随后
+            # 冻结/升代，重复报告同一条试投请求仍应得到 409，而不是被当成旧代次回执）
+            dup_req = c.execute(
+                "SELECT feedback_id FROM feedback_receipts WHERE request_id=?",
+                (request_id,)).fetchone()
+            if dup_req:
+                audit(actor, "feedback.duplicate", "feedback", feedback_id,
+                      f"rollout={rollout_id} request={request_id} 已有入账回执 "
+                      f"{dup_req['feedback_id']}，一条请求只能报告一次")
+                raise Conflict(f"request_id={request_id} 已有入账回执 "
+                               f"{dup_req['feedback_id']}，一条请求只能报告一次")
+            # 2) 必须命中候选构件（冻结期产生的调用命中基线，仅审计）
+            if req["version_id"] != r["candidate_version_id"]:
+                # 批次已被自动止损冻结时，冻结期基线请求给出更明确的原因
+                if r["status"] == "frozen" and r["stoploss_tripped"]:
+                    return reject("stoploss_tripped",
+                                  f"批次已自动止损冻结，请求命中基线 {req['version_id']}")
+                return reject("hit_baseline",
+                              f"请求命中基线构件 {req['version_id']}，非候选")
+            # 候选命中但批次已不在放量：冻结（含止损）/完成/撤销后的候选命中理论上不会
+            # 新增（路由层已回落），仍明确记录，绝不触发状态变化
+            if r["status"] != "ramping":
+                if r["stoploss_tripped"]:
+                    return reject("stoploss_tripped", f"批次已自动止损冻结（{r['status']}）")
+                return reject("rollout_not_ramping", f"批次当前状态 {r['status']}")
+            # 3) 旧代次只留审计（状态仍为 ramping，但请求是旧代次产生的）
+            if req["rollout_generation"] != r["generation"]:
+                return reject("stale_generation",
+                              f"请求命中代次 {req['rollout_generation']}，"
+                              f"当前代次 {r['generation']}")
+            # 6) 止损配置必须就位
+            cfg = c.execute("SELECT * FROM stoploss_configs WHERE rollout_id=?",
+                            (rollout_id,)).fetchone()
+            if not cfg:
+                return reject("stoploss_not_configured", "批次尚未配置止损参数")
+            # 4) 观察窗口（惰性开窗前先判迟到：开窗不改变时间判定）
+            now = _db_now(c)
+            req_at = req["created_at"]
+            age = c.execute(
+                "SELECT CAST((julianday(?) - julianday(?)) * 86400 AS INTEGER) AS age",
+                (now, req_at)).fetchone()["age"]
+            if age is None or age < 0 or age > int(cfg["window_seconds"]):
+                return reject("late_receipt",
+                              f"请求产生于 {req_at}，超出观察窗口 {cfg['window_seconds']}s")
+
+            window = _get_or_open_window(c, rollout_id, cfg)
+            c.execute(
+                """INSERT INTO feedback_receipts(feedback_id,rollout_id,window_id,request_id,
+                   outcome,request_created_at,actor)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (feedback_id, rollout_id, window["window_id"], request_id, outcome,
+                 req_at, actor))
+
+            stats = _window_stats(c, window, req_at)
+            over_limit = stats["fail_ratio"] > float(window["fail_ratio_limit"]) + 1e-12
+            reached_sample = stats["total"] >= int(window["min_sample"])
+            tripped, trigger_id = False, None
+            if reached_sample and over_limit:
+                # —— 单事务自动止损：冻结批次 + 流量回落基线（frozen 语义）+ 快照。
+                # 行守卫 rowcount=0 说明批次恰在本事务期间被另一越界回执冻结：
+                # 本回执不得入账/触发，整单回滚后重试，在最新状态下走只审计分支。
+                cur = c.execute(
+                    "UPDATE rollouts SET status='frozen', stoploss_tripped=1, "
+                    "generation=generation+1, updated_at=datetime('now') "
+                    "WHERE rollout_id=? AND status='ramping'", (rollout_id,))
+                if cur.rowcount != 1:
+                    raise _ConcurrentTrip()
+                trigger_id = _uid("trg")
+                snapshot = {
+                    "rollout_id": rollout_id,
+                    "frozen_generation_before": r["generation"],
+                    "frozen_generation_after": r["generation"] + 1,
+                    "candidate_version_id": r["candidate_version_id"],
+                    "candidate_semver": _semver(c, r["candidate_version_id"]),
+                    "base_version_id": r["base_version_id"],
+                    "base_semver": _semver(c, r["base_version_id"]),
+                    "family_id": r["family_id"], "weight": r["weight"],
+                    "window_seconds": window["window_seconds"],
+                    "min_sample": window["min_sample"],
+                    "fail_ratio_limit": window["fail_ratio_limit"],
+                    "stats": stats, "trigger_request_id": request_id,
+                    "trigger_feedback_id": feedback_id,
+                    "traffic_action": "frozen: 新流量（含本应命中候选的 key）全部回落基线",
+                }
+                c.execute(
+                    """INSERT INTO stoploss_triggers(trigger_id,window_id,rollout_id,
+                       rollout_generation,candidate_version_id,candidate_semver,
+                       base_version_id,base_semver,weight,total_sample,fail_count,
+                       fail_ratio,trigger_feedback_id,snapshot_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (trigger_id, window["window_id"], rollout_id, r["generation"],
+                     r["candidate_version_id"], snapshot["candidate_semver"],
+                     r["base_version_id"], snapshot["base_semver"], r["weight"],
+                     stats["total"], stats["fails"], stats["fail_ratio"],
+                     feedback_id, json.dumps(snapshot, ensure_ascii=False, sort_keys=True)))
+                c.execute(
+                    "UPDATE stoploss_windows SET status='tripped', closed_at=datetime('now'), "
+                    "trigger_id=? WHERE window_id=?", (trigger_id, window["window_id"]))
+                audit(actor, "stoploss.trip", "rollout", rollout_id,
+                      f"trigger={trigger_id} window={window['window_id']} "
+                      f"sample={stats['total']} fail={stats['fails']} "
+                      f"ratio={stats['fail_ratio']:.2f} > {window['fail_ratio_limit']:.2f}；"
+                      f"单事务冻结批次，新流量回落基线 {r['base_version_id']}，"
+                      f"代次 {r['generation']} -> {r['generation'] + 1}")
+                tripped = True
+            audit(actor, "feedback.credited", "feedback", feedback_id,
+                  f"rollout={rollout_id} window={window['window_id']} request={request_id} "
+                  f"outcome={outcome}" + (" TRIP" if tripped else ""))
+            return {"feedback_id": feedback_id, "rollout_id": rollout_id,
+                    "request_id": request_id, "outcome": outcome, "credited": True,
+                    "reject_reason": None,
+                    "window_id": window["window_id"], "window_seq": window["seq"],
+                    "stats": stats,
+                    "threshold": {"min_sample": window["min_sample"],
+                                  "fail_ratio_limit": window["fail_ratio_limit"],
+                                  "reached_sample": reached_sample, "over_limit": over_limit},
+                    "tripped": tripped, "trigger_id": trigger_id}
+
+    # 写锁串行下仍可能出现"读过 ramping 后赢家先提交冻结"的交错；最多重试一次，
+    # 重试在最新已提交状态下重新判定（重复/旧代次/已冻结均有确定性归宿）。
+    try:
+        return _attempt()
+    except _ConcurrentTrip:
+        return _attempt()
+
+
+# ---------------------------------------------------------------- 人工恢复
+
+def recover_rollout(rollout_id: str, expected_generation: int, actor: str) -> dict:
+    """人工恢复自动止损：开启新代次并重置统计窗口。
+
+    - 仅可对自动止损冻结（frozen + stoploss_tripped）的批次执行；
+    - 单事务：CAS 回 ramping（代次 +1）、清除止损标记、关闭已触发窗口、
+      按当前配置开窗（seq+1，统计清零）；
+    - 旧窗口（tripped）、触发快照、历史回执与请求全部保留，可继续复核；
+    - 权重不变，恢复后按稳定散列分流（冻结前同 key 的决定与桶号一致）。
+    """
+    with write_tx() as c:
+        r = c.execute("SELECT * FROM rollouts WHERE rollout_id=?", (rollout_id,)).fetchone()
+        if not r:
+            raise NotFound(f"放量批次不存在: {rollout_id}")
+        if r["status"] != "frozen" or not r["stoploss_tripped"]:
+            raise Conflict("只能对自动止损触发的冻结批次做人工恢复（普通冻结请用 resume）")
+        if r["generation"] != expected_generation:
+            raise Conflict("并发冲突：批次代次已变化（CAS 失败），请刷新后重试")
+        cur = c.execute(
+            "UPDATE rollouts SET status='ramping', stoploss_tripped=0, "
+            "generation=generation+1, updated_at=datetime('now') "
+            "WHERE rollout_id=? AND status='frozen' AND stoploss_tripped=1 AND generation=?",
+            (rollout_id, expected_generation))
+        if cur.rowcount != 1:
+            raise Conflict("并发冲突：批次状态已变化，人工恢复中止（CAS 失败）")
+        old_w = c.execute(
+            "SELECT * FROM stoploss_windows WHERE rollout_id=? AND status='tripped' "
+            "ORDER BY seq DESC LIMIT 1", (rollout_id,)).fetchone()
+        old_seq = old_w["seq"] if old_w else 0
+        cfg = c.execute("SELECT * FROM stoploss_configs WHERE rollout_id=?",
+                        (rollout_id,)).fetchone()
+        if not cfg:
+            raise Conflict("批次缺少止损配置，无法重置统计窗口（请先重新配置）")
+        new_window_id = _uid("win")
+        c.execute(
+            """INSERT INTO stoploss_windows(window_id,rollout_id,seq,status,window_seconds,
+               min_sample,fail_ratio_limit,started_at)
+               VALUES (?,?,?, 'active',?,?,?, datetime('now'))""",
+            (new_window_id, rollout_id, old_seq + 1, cfg["window_seconds"],
+             cfg["min_sample"], cfg["fail_ratio_limit"]))
+        audit(actor, "stoploss.recover", "rollout", rollout_id,
+              f"人工恢复：新代次 {expected_generation} -> {expected_generation + 1}，"
+              f"新窗口 {new_window_id} seq={old_seq + 1} 统计重置（窗口 {cfg['window_seconds']}s/"
+              f"min_sample={cfg['min_sample']}/limit={cfg['fail_ratio_limit']:.2f}），"
+              f"旧窗口与历史请求保留复核")
+    return get_rollout(rollout_id)
+
+
+# ---------------------------------------------------------------- 触发 / 回执查询
+
+def list_triggers(rollout_id: str | None = None) -> list[dict]:
+    q = "SELECT * FROM stoploss_triggers"
+    args: tuple = ()
+    if rollout_id:
+        q += " WHERE rollout_id=?"
+        args = (rollout_id,)
+    q += " ORDER BY created_at DESC"
+    out = []
+    for r in get_conn().execute(q, args).fetchall():
+        d = dict(r)
+        d["snapshot"] = _loads(d.pop("snapshot_json"))
+        out.append(d)
+    return out
+
+
+def get_trigger(trigger_id: str) -> dict:
+    r = get_conn().execute("SELECT * FROM stoploss_triggers WHERE trigger_id=?",
+                           (trigger_id,)).fetchone()
+    if not r:
+        raise NotFound(f"触发快照不存在: {trigger_id}")
+    d = dict(r)
+    d["snapshot"] = _loads(d.pop("snapshot_json"))
+    return d
+
+
+def list_receipts(rollout_id: str | None = None, window_id: str | None = None,
+                  limit: int = 200) -> list[dict]:
+    q = ("SELECT fb.*, w.seq AS window_seq, ver.semver AS hit_semver, "
+         "req.routing_key AS routing_key, req.rollout_generation AS hit_generation "
+         "FROM feedback_receipts fb "
+         "JOIN stoploss_windows w ON w.window_id=fb.window_id "
+         "JOIN requests req ON req.request_id=fb.request_id "
+         "JOIN versions ver ON ver.version_id=req.version_id")
+    clauses, args = [], []
+    if rollout_id:
+        clauses.append("fb.rollout_id=?"); args.append(rollout_id)
+    if window_id:
+        clauses.append("fb.window_id=?"); args.append(window_id)
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
+    q += " ORDER BY fb.created_at DESC LIMIT ?"
+    args.append(limit)
+    return [dict(r) for r in get_conn().execute(q, tuple(args)).fetchall()]
+
+
+def get_receipt(feedback_id: str) -> dict:
+    r = get_conn().execute(
+        "SELECT * FROM feedback_receipts WHERE feedback_id=?",
+        (feedback_id,)).fetchone()
+    if not r:
+        raise NotFound(f"回执不存在: {feedback_id}")
+    return dict(r)
+
+
+def get_request_receipt(request_id: str) -> dict | None:
+    r = get_conn().execute(
+        "SELECT * FROM feedback_receipts WHERE request_id=?",
+        (request_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def list_rejected_feedback(rollout_id: str, limit: int = 200) -> list[dict]:
+    """审计流中该批次被拒/重复的回执尝试（旧代次、迟到、无关请求等）。"""
+    rows = get_conn().execute(
+        "SELECT * FROM audit_log WHERE action IN ('feedback.reject','feedback.duplicate') "
+        "AND detail LIKE ? ORDER BY id DESC LIMIT ?",
+        (f"%{rollout_id}%", limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def stoploss_overview(rollout_id: str) -> dict:
+    """历史页面聚合：批次、配置、窗口（含统计）、触发快照、入账与被拒回执。"""
+    ro = get_rollout(rollout_id)
+    cfg = get_stoploss_config(rollout_id)
+    windows = list_windows(rollout_id)
+    conn = get_conn()
+    for w in windows:
+        stats_row = conn.execute(
+            """SELECT COUNT(*) AS total,
+                      COALESCE(SUM(CASE WHEN outcome='failure' THEN 1 ELSE 0 END),0) AS fails
+               FROM feedback_receipts WHERE window_id=?""", (w["window_id"],)).fetchone()
+        w["total"] = int(stats_row["total"])
+        w["fails"] = int(stats_row["fails"])
+        w["fail_ratio"] = (w["fails"] / w["total"]) if w["total"] else 0.0
+        trg = conn.execute("SELECT trigger_id FROM stoploss_triggers WHERE window_id=?",
+                           (w["window_id"],)).fetchone()
+        w["trigger_id"] = trg["trigger_id"] if trg else None
+    return {
+        "rollout": ro, "config": cfg, "windows": windows,
+        "triggers": list_triggers(rollout_id),
+        "receipts": list_receipts(rollout_id=rollout_id),
+        "rejected": list_rejected_feedback(rollout_id),
+        "active_window": next((w for w in windows if w["status"] == "active"), None),
+    }
 
 
 # ================================================================ 线上调用
@@ -752,6 +1246,12 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
                 hit_version_id = cand["version_id"]
                 hit_rollout_id = rollout["rollout_id"]
                 hit_generation = rollout["generation"]
+        elif rollout and rollout["status"] == "frozen":
+            # 冻结（含自动止损冻结）期间，调用一律命中基线构件，但仍固化批次与代次：
+            # 这样该调用的回执能被识别为"属于本试投、冻结期基线请求"（hit_baseline/
+            # stoploss_tripped，仅审计），而不会与完全无关的请求混为一谈。
+            hit_rollout_id = rollout["rollout_id"]
+            hit_generation = rollout["generation"]
         v = c.execute("SELECT * FROM versions WHERE version_id=?", (hit_version_id,)).fetchone()
         contract = _loads(v["variable_contract"])
         params = _loads(v["model_params"])

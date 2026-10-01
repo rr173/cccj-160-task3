@@ -204,6 +204,9 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/families/([\w.-]+)/rollout", p)
         if method == "GET" and m:
             return self._page_rollout(m.group(1), q)
+        m = re.fullmatch(r"/rollouts/([\w.-]+)/stoploss", p)
+        if method == "GET" and m:
+            return self._page_stoploss(m.group(1), q)
 
         # ------------------------------------------------ UI 表单动作
         if method == "POST" and re.fullmatch(r"/ui/families/[\w.-]+/versions", p):
@@ -224,6 +227,18 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and \
                 re.fullmatch(r"/ui/rollouts/[\w.-]+/(ramp|freeze|resume|complete|cancel)", p):
             return self._ui_rollout_action(p.split("/")[3], p.split("/")[-1])
+        if method == "POST" and \
+                re.fullmatch(r"/ui/rollouts/[\w.-]+/stoploss/config", p):
+            return self._ui_stoploss_config(p.split("/")[3])
+        if method == "POST" and \
+                re.fullmatch(r"/ui/rollouts/[\w.-]+/stoploss/recover", p):
+            return self._ui_stoploss_recover(p.split("/")[3])
+        if method == "POST" and \
+                re.fullmatch(r"/ui/rollouts/[\w.-]+/feedback", p):
+            return self._ui_feedback(p.split("/")[3])
+        if method == "POST" and \
+                re.fullmatch(r"/ui/requests/[\w.-]+/feedback", p):
+            return self._ui_feedback(p.split("/")[3])
         if method == "POST" and re.fullmatch(r"/ui/requests/[\w.-]+/replay", p):
             return self._ui_replay(p.split("/")[3])
         if method == "POST" and p == "/ui/families":
@@ -330,6 +345,56 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 res = services.cancel_rollout(rid, int(gen), actor)
             return self._json(res)
+        # -------- 自动止损：配置 / 回执 / 恢复 / 历史
+        m = re.fullmatch(r"/api/rollouts/([\w.-]+)/stoploss/config", p)
+        if m and method == "POST":
+            b = _json_body(self)
+            for key in ("window_seconds", "min_sample", "fail_ratio_limit"):
+                if key not in b:
+                    raise services.DomainError(f"止损配置缺少字段: {key}")
+            res = services.configure_stoploss(
+                m.group(1), int(b["window_seconds"]), int(b["min_sample"]),
+                float(b["fail_ratio_limit"]), b.get("actor", "api"))
+            return self._json(res, 200)
+        if method == "GET" and m:
+            res = services.get_stoploss_config(m.group(1))
+            if res is None:
+                self._json({"error": "NotFound", "message": "该批次尚未配置止损"}, 404)
+            else:
+                return self._json(res)
+        m = re.fullmatch(r"/api/rollouts/([\w.-]+)/stoploss", p)
+        if method == "GET" and m:
+            return self._json(services.stoploss_overview(m.group(1)))
+        m = re.fullmatch(r"/api/rollouts/([\w.-]+)/feedback", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            for key in ("feedback_id", "request_id", "outcome"):
+                if not b.get(key):
+                    raise services.DomainError(f"回执缺少字段: {key}")
+            res = services.report_feedback(
+                m.group(1), str(b["feedback_id"]), str(b["request_id"]),
+                b["outcome"], b.get("actor", "api"))
+            return self._json(res, 201 if res.get("credited") else 200)
+        m = re.fullmatch(r"/api/rollouts/([\w.-]+)/recover", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            if b.get("expected_generation") is None:
+                raise services.DomainError("必须提供 expected_generation 做原子冲突控制")
+            res = services.recover_rollout(m.group(1), int(b["expected_generation"]),
+                                           b.get("actor", "api"))
+            return self._json(res)
+        m = re.fullmatch(r"/api/stoploss/triggers/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._json(services.get_trigger(m.group(1)))
+        if method == "GET" and p == "/api/stoploss/triggers":
+            return self._json(services.list_triggers(q.get("rollout", [None])[0]))
+        if method == "GET" and p == "/api/feedback":
+            return self._json(services.list_receipts(
+                rollout_id=q.get("rollout", [None])[0],
+                window_id=q.get("window", [None])[0]))
+        m = re.fullmatch(r"/api/feedback/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._json(services.get_receipt(m.group(1)))
         m = re.fullmatch(r"/api/requests/([\w.-]+)", p)
         if method == "GET" and m:
             return self._json(services.get_request(m.group(1)))
@@ -363,7 +428,8 @@ class Handler(BaseHTTPRequestHandler):
             if ro:
                 cand = next((v for v in versions
                              if v["version_id"] == ro["candidate_version_id"]), None)
-                ro = {**ro, "candidate_semver": cand["semver"] if cand else "?"}
+                ro = {**ro, "candidate_semver": cand["semver"] if cand else "?",
+                      "is_tripped": bool(ro["stoploss_tripped"]) and ro["status"] == "frozen"}
             rows.append({"family_id": f["family_id"], "name": f["name"],
                          "description": f["description"],
                          "active": _ver_context(active) if active else None,
@@ -479,7 +545,9 @@ class Handler(BaseHTTPRequestHandler):
             d["open"] = r["status"] in ("ramping", "frozen")
             d["is_ramping"] = r["status"] == "ramping"
             d["is_frozen"] = r["status"] == "frozen"
+            d["is_tripped"] = bool(r["stoploss_tripped"]) and r["status"] == "frozen"
             d["next_weight"] = min(100, r["weight"] + 10)
+            d["stoploss_cfg"] = services.get_stoploss_config(r["rollout_id"])
             return d
 
         rows = [enrich(r) for r in rollouts]
@@ -500,6 +568,70 @@ class Handler(BaseHTTPRequestHandler):
                "flash": self._flash(q)}
         self._html(page(f"{family['name']} · 放量批次", "rollout.html", ctx))
 
+    def _page_stoploss(self, rid, q):
+        self._is_page = True
+        ov = services.stoploss_overview(rid)
+        ro, cfg = ov["rollout"], ov["config"]
+        versions = {v["version_id"]: _ver_context(v)
+                    for v in services.list_versions(ro["family_id"])}
+        family = services.get_family(ro["family_id"])
+
+        def pct(x) -> str:
+            return f"{float(x) * 100:.0f}%"
+
+        cand = versions.get(ro["candidate_version_id"])
+        base = versions.get(ro["base_version_id"])
+        ro_view = {
+            "rollout_id": rid, "status": ro["status"], "weight": ro["weight"],
+            "generation": ro["generation"],
+            "is_tripped": bool(ro["stoploss_tripped"]) and ro["status"] == "frozen",
+            "is_ramping": ro["status"] == "ramping",
+            "candidate_version_id": ro["candidate_version_id"],
+            "base_version_id": ro["base_version_id"],
+            "candidate_semver": cand["semver"] if cand else "?",
+            "base_semver": base["semver"] if base else "?",
+        }
+        cfg_view = ({"window_seconds": cfg["window_seconds"], "min_sample": cfg["min_sample"],
+                     "fail_ratio_limit": f"{cfg['fail_ratio_limit']:.2f}"}
+                    if cfg else {"window_seconds": 3600, "min_sample": 20,
+                                 "fail_ratio_limit": "0.20"})
+        active = None
+        if ov["active_window"]:
+            w = ov["active_window"]
+            active = {"window_id": w["window_id"], "seq": w["seq"],
+                      "started_at": w["started_at"], "window_seconds": w["window_seconds"],
+                      "min_sample": w["min_sample"], "total": w["total"], "fails": w["fails"],
+                      "fail_pct": pct(w["fail_ratio"]), "limit_pct": pct(w["fail_ratio_limit"]),
+                      "at_or_over_sample": w["total"] >= w["min_sample"],
+                      "over_limit": w["fail_ratio"] > w["fail_ratio_limit"] + 1e-12}
+        active_has_receipts = bool(active and active["total"] > 0)
+        windows = [{"seq": w["seq"], "status": w["status"],
+                    "window_seconds": w["window_seconds"], "min_sample": w["min_sample"],
+                    "total": w["total"], "fails": w["fails"], "fail_pct": pct(w["fail_ratio"]),
+                    "limit_pct": pct(w["fail_ratio_limit"]), "started_at": w["started_at"]}
+                   for w in ov["windows"]]
+        triggers = [{"trigger_id": t["trigger_id"], "created_at": t["created_at"],
+                     "window_id": t["window_id"], "rollout_generation": t["rollout_generation"],
+                     "candidate_semver": t["candidate_semver"], "base_semver": t["base_semver"],
+                     "weight": t["weight"], "total_sample": t["total_sample"],
+                     "fail_count": t["fail_count"], "fail_pct": pct(t["fail_ratio"]),
+                     "trigger_feedback_id": t["trigger_feedback_id"]}
+                    for t in ov["triggers"]]
+        receipts = [{"feedback_id": r["feedback_id"], "outcome": r["outcome"],
+                     "request_id": r["request_id"], "window_seq": r["window_seq"],
+                     "hit_semver": r["hit_semver"], "routing_key": r["routing_key"] or "",
+                     "hit_generation": r["hit_generation"],
+                     "request_created_at": r["request_created_at"]}
+                    for r in ov["receipts"]]
+        rejected = [{"created_at": r["created_at"], "entity_id": r["entity_id"],
+                     "detail": r["detail"], "action": r["action"]}
+                    for r in ov["rejected"]]
+        ctx = {"family": family, "ro": ro_view, "cfg": cfg_view, "active": active,
+               "active_has_receipts": active_has_receipts, "windows": windows,
+               "triggers": triggers, "receipts": receipts, "rejected": rejected,
+               "flash": self._flash(q)}
+        self._html(page(f"自动止损 · {ro_view['candidate_semver']}", "stoploss.html", ctx))
+
     def _page_replay(self, rid, q):
         self._is_page = True
         req = services.get_request(rid)
@@ -518,6 +650,28 @@ class Handler(BaseHTTPRequestHandler):
                 rollout = services.get_rollout(req["rollout_id"])
             except services.NotFound:
                 rollout = None
+        receipt = services.get_request_receipt(rid)
+        is_candidate_hit = bool(
+            rollout and req["version_id"] == rollout["candidate_version_id"])
+        same_generation = bool(
+            rollout and req["rollout_generation"] == rollout["generation"])
+        stoploss_cfg = services.get_stoploss_config(req["rollout_id"]) if req.get("rollout_id") else None
+        feedback_card = {
+            "rollout_id": req.get("rollout_id") or "",
+            "is_candidate_hit": is_candidate_hit,
+            "same_generation": same_generation,
+            "rollout_status": rollout["status"] if rollout else "",
+            "rollout_tripped": bool(rollout and rollout["stoploss_tripped"]),
+            "hit_generation": req.get("rollout_generation"),
+            "current_generation": rollout["generation"] if rollout else None,
+            "configured": bool(stoploss_cfg),
+            "feedback_id": receipt["feedback_id"] if receipt else "",
+            "outcome": receipt["outcome"] if receipt else "",
+            "credited_at": receipt["created_at"] if receipt else "",
+            "window_id": receipt["window_id"] if receipt else "",
+            "can_report": bool(rollout and not receipt and
+                               rollout["status"] == "ramping" and stoploss_cfg),
+        }
         ctx = {"req": {"request_id": rid, "family_id": req["family_id"],
                        "family_name": family["name"], "version_id": req["version_id"],
                        "model_id": req["model_id"],
@@ -538,6 +692,7 @@ class Handler(BaseHTTPRequestHandler):
                        if req.get("params_json") else "",
                        "created_at": req["created_at"]},
                "rollout": rollout,
+               "feedback": feedback_card,
                "versions": versions, "models": llm.list_models(),
                "replays": rpl_rows, "result": None, "flash": self._flash(q)}
         # 若带 ?rpl= 则展示该报告详情
@@ -634,6 +789,43 @@ class Handler(BaseHTTPRequestHandler):
         else:
             ro = services.cancel_rollout(rid, gen, actor)
         self._redirect(f"/families/{ro['family_id']}/rollout")
+
+    def _ui_stoploss_config(self, rid):
+        self._is_page = True
+        f = _form(self)
+        services.configure_stoploss(
+            rid, int(f["window_seconds"]), int(f["min_sample"]),
+            float(f["fail_ratio_limit"]), f.get("actor", "web") or "web")
+        self._redirect(f"/rollouts/{rid}/stoploss")
+
+    def _ui_stoploss_recover(self, rid):
+        self._is_page = True
+        f = _form(self)
+        services.recover_rollout(rid, int(f["expected_generation"]),
+                                 f.get("actor", "web") or "web")
+        self._redirect(f"/rollouts/{rid}/stoploss")
+
+    def _ui_feedback(self, rollout_id):
+        self._is_page = True
+        f = _form(self)
+        request_id = f["request_id"]
+        try:
+            res = services.report_feedback(
+                rollout_id, f["feedback_id"].strip(), request_id, f["outcome"],
+                f.get("actor", "web") or "web")
+        except services.Conflict as exc:
+            # 重复回执（feedback_id/request_id 已入账）：回到调用详情页提示
+            self._redirect(f"/requests/{request_id}/replay?err=" + quote(str(exc)[:200]))
+            return
+        if not res.get("credited"):
+            self._redirect(f"/requests/{request_id}/replay?err=" + quote(
+                f"回执未入账（{res['reject_reason']}）：仅保留审计记录，未触发状态变化"))
+        elif res.get("tripped"):
+            self._redirect(f"/rollouts/{rollout_id}/stoploss?err=" + quote(
+                f"回执已入账并触发自动止损：样本 {res['stats']['total']}，"
+                f"失败 {res['stats']['fails']}，批次已冻结、流量回落基线"))
+        else:
+            self._redirect(f"/requests/{request_id}/replay")
 
     def _ui_replay(self, rid):
         self._is_page = True

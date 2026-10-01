@@ -132,9 +132,72 @@ CREATE TABLE IF NOT EXISTS rollouts (
     status           TEXT NOT NULL DEFAULT 'ramping',
         -- ramping / frozen / completed / cancelled
     generation       INTEGER NOT NULL DEFAULT 1,  -- 批次代次：每次状态/权重切换 +1
+    stoploss_tripped INTEGER NOT NULL DEFAULT 0,  -- 1=曾被自动止损冻结（恢复后重置为0）
     created_by       TEXT NOT NULL DEFAULT 'api',
     created_at       TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 自动止损配置：业务方为一次流量试投设置观察窗口、最小样本量与失败占比上限。
+-- 一份配置对应一个放量批次；统计窗口开启后（已有入账回执）配置冻结，修改需先
+-- 人工恢复重置窗口，避免窗口中途移动门槛。
+CREATE TABLE IF NOT EXISTS stoploss_configs (
+    rollout_id       TEXT PRIMARY KEY REFERENCES rollouts(rollout_id),
+    window_seconds   INTEGER NOT NULL,        -- 滚动观察窗口长度（秒，按请求产生时间）
+    min_sample       INTEGER NOT NULL,        -- 最小样本量（窗口内入账回执数达到才评估）
+    fail_ratio_limit REAL NOT NULL,           -- 失败占比上限 (0,1]，严格越过才止损
+    created_by       TEXT NOT NULL DEFAULT 'api',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 止损统计窗口：首条有效回执惰性开窗；人工恢复关闭旧窗并开启 seq+1 的新窗。
+-- 旧窗口与其回执永久保留，供历史页面与请求复核回溯。
+CREATE TABLE IF NOT EXISTS stoploss_windows (
+    window_id        TEXT PRIMARY KEY,
+    rollout_id       TEXT NOT NULL REFERENCES rollouts(rollout_id),
+    seq              INTEGER NOT NULL,        -- 批次内窗口序号（恢复一次 +1）
+    status           TEXT NOT NULL DEFAULT 'active',  -- active / tripped / closed
+    window_seconds   INTEGER NOT NULL,        -- 开窗时的配置快照
+    min_sample       INTEGER NOT NULL,
+    fail_ratio_limit REAL NOT NULL,
+    started_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    closed_at        TEXT,
+    trigger_id       TEXT,
+    UNIQUE(rollout_id, seq)
+);
+
+-- 止损触发快照：越界当时的样本/失败/占比与批次路由现场，单事务写入。
+CREATE TABLE IF NOT EXISTS stoploss_triggers (
+    trigger_id       TEXT PRIMARY KEY,
+    window_id        TEXT NOT NULL REFERENCES stoploss_windows(window_id),
+    rollout_id       TEXT NOT NULL,
+    rollout_generation INTEGER NOT NULL,       -- 触发时（冻结前）批次代次
+    candidate_version_id TEXT NOT NULL,
+    candidate_semver TEXT NOT NULL DEFAULT '',
+    base_version_id  TEXT NOT NULL,
+    base_semver      TEXT NOT NULL DEFAULT '',
+    weight           INTEGER NOT NULL,
+    total_sample     INTEGER NOT NULL,
+    fail_count       INTEGER NOT NULL,
+    fail_ratio       REAL NOT NULL,
+    trigger_feedback_id TEXT NOT NULL,        -- 压过阈值的那一条回执
+    snapshot_json    TEXT NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 效果回执：只存"入账"回执（feedback_id 主键天然去重；request_id 唯一保证一条
+-- 请求只能入账一次）。未入账回执（重复/旧代次/无关/迟到/未配置/批次非放量态）
+-- 只写 audit_log，不触发任何状态变化。
+CREATE TABLE IF NOT EXISTS feedback_receipts (
+    feedback_id      TEXT PRIMARY KEY,
+    rollout_id       TEXT NOT NULL,
+    window_id        TEXT NOT NULL REFERENCES stoploss_windows(window_id),
+    request_id       TEXT NOT NULL UNIQUE,
+    outcome          TEXT NOT NULL,           -- success / failure
+    request_created_at TEXT NOT NULL,         -- 复制自 requests.created_at，滚动窗口据此判定
+    actor            TEXT NOT NULL DEFAULT 'api',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- 重演报告
@@ -171,6 +234,10 @@ CREATE INDEX IF NOT EXISTS idx_eval_version ON eval_runs(version_id);
 CREATE INDEX IF NOT EXISTS idx_requests_version ON requests(version_id);
 CREATE INDEX IF NOT EXISTS idx_replays_request ON replays(request_id);
 CREATE INDEX IF NOT EXISTS idx_rollouts_family ON rollouts(family_id);
+CREATE INDEX IF NOT EXISTS idx_windows_rollout ON stoploss_windows(rollout_id);
+CREATE INDEX IF NOT EXISTS idx_receipts_window ON feedback_receipts(window_id);
+CREATE INDEX IF NOT EXISTS idx_receipts_rollout ON feedback_receipts(rollout_id);
+CREATE INDEX IF NOT EXISTS idx_triggers_rollout ON stoploss_triggers(rollout_id);
 """
 
 # 老库增量迁移：requests 的放量证据列（新库已由 _SCHEMA 建全）
@@ -181,6 +248,11 @@ _REQUESTS_NEW_COLUMNS = {
     "params_json": "ALTER TABLE requests ADD COLUMN params_json TEXT NOT NULL DEFAULT ''",
     "params_fingerprint":
         "ALTER TABLE requests ADD COLUMN params_fingerprint TEXT NOT NULL DEFAULT ''",
+}
+
+# 老库增量迁移：rollouts 的自动止损标记列
+_ROLLOUTS_NEW_COLUMNS = {
+    "stoploss_tripped": "ALTER TABLE rollouts ADD COLUMN stoploss_tripped INTEGER NOT NULL DEFAULT 0",
 }
 
 _lock = threading.Lock()
@@ -204,6 +276,10 @@ def init_db() -> None:
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(requests)")}
             for col, ddl in _REQUESTS_NEW_COLUMNS.items():
                 if col not in cols:
+                    conn.execute(ddl)
+            rcols = {r["name"] for r in conn.execute("PRAGMA table_info(rollouts)")}
+            for col, ddl in _ROLLOUTS_NEW_COLUMNS.items():
+                if col not in rcols:
                     conn.execute(ddl)
             conn.commit()
         finally:

@@ -1,0 +1,676 @@
+"""HTTP 入口：JSON API + 评估页面 + 重演报告（仅依赖标准库）。"""
+from __future__ import annotations
+
+import json
+import re
+import traceback
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urlparse
+
+from . import config, llm, services
+from .db import audit, get_conn, init_db
+from .jinja_compat import render_text
+
+TPL_DIR = Path(__file__).resolve().parent / "templates"
+
+_CSS = """
+:root{--bg:#0f1420;--panel:#171e2e;--line:#27324a;--ink:#e6ebf5;--mut:#93a0b8;
+--ok:#2fbf71;--bad:#ef5b5b;--warn:#e8a838;--acc:#4f8cff;--chip:#22304a}
+*{box-sizing:border-box}body{margin:0;font:14px/1.55 -apple-system,Segoe UI,Roboto,
+'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;background:var(--bg);
+color:var(--ink)}a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+header{padding:14px 22px;border-bottom:1px solid var(--line);display:flex;gap:18px;
+align-items:center;background:#121826}header .brand{font-weight:700;font-size:16px}
+header nav a{color:var(--mut);margin-right:14px}header nav a.on,header nav a:hover{color:var(--ink)}
+.wrap{max-width:1180px;margin:22px auto;padding:0 20px}
+.grid{display:grid;gap:16px}.g2{grid-template-columns:1fr 1fr}.g3{grid-template-columns:1fr 1fr 1fr}
+@media(max-width:900px){.g2,.g3{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.card h2{margin:0 0 12px;font-size:15px}.card h3{margin:18px 0 8px;font-size:13px;color:var(--mut);
+text-transform:uppercase;letter-spacing:.06em}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px 10px;
+border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--mut);font-weight:600}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.small{font-size:12px;color:var(--mut)}.chip{display:inline-block;padding:2px 9px;border-radius:999px;
+background:var(--chip);font-size:12px;border:1px solid var(--line)}
+.badge{display:inline-block;padding:2px 9px;border-radius:6px;font-size:12px;font-weight:600}
+.b-active{background:rgba(47,191,113,.15);color:var(--ok);border:1px solid rgba(47,191,113,.4)}
+.b-draft{background:#2a3346;color:var(--mut)}.b-approved{background:rgba(79,140,255,.15);
+color:var(--acc);border:1px solid rgba(79,140,255,.4)}.b-evaluating{background:rgba(232,168,56,.15);
+color:var(--warn)}.b-evaluated{background:rgba(47,191,113,.12);color:var(--ok)}
+.b-failed_eval,.b-rejected,.b-abandoned{background:rgba(239,91,91,.13);color:var(--bad)}
+.b-superseded{background:#232c3f;color:#8a97ae}
+.b-ramping{background:rgba(232,168,56,.15);color:var(--warn);border:1px solid rgba(232,168,56,.4)}
+.b-frozen{background:rgba(79,140,255,.15);color:var(--acc);border:1px solid rgba(79,140,255,.4)}
+.b-completed{background:rgba(47,191,113,.15);color:var(--ok);border:1px solid rgba(47,191,113,.4)}
+.b-cancelled{background:#232c3f;color:#8a97ae}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.mut{color:var(--mut)}
+input,select,textarea{width:100%;background:#0f1624;border:1px solid var(--line);color:var(--ink);
+border-radius:8px;padding:8px 10px;font:inherit;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+textarea{min-height:90px;resize:vertical}label{display:block;margin:10px 0 4px;font-size:12.5px;
+color:var(--mut)}
+button,.btn{display:inline-block;background:var(--acc);color:#fff;border:0;border-radius:8px;
+padding:7px 14px;font:inherit;font-weight:600;cursor:pointer}button.ghost,.btn.ghost{background:#26304a;
+color:var(--ink);border:1px solid var(--line)}button.danger{background:#5a2a2a}
+button:disabled{opacity:.45;cursor:not-allowed}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+pre{background:#0d1320;border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;
+font-size:12px;max-height:340px}
+.kv{display:grid;grid-template-columns:130px 1fr;gap:4px 12px;font-size:13px}.kv div:nth-child(odd){color:var(--mut)}
+.flash{background:rgba(239,91,91,.12);border:1px solid rgba(239,91,91,.4);color:#ffb4b4;padding:10px 14px;
+border-radius:8px;margin-bottom:14px}.note{background:rgba(79,140,255,.08);border:1px solid
+rgba(79,140,255,.3);padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:13px}
+.axis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0}
+.axis div{background:#0d1320;border:1px solid var(--line);border-radius:8px;padding:10px;text-align:center}
+"""
+
+
+def render_template(name: str, ctx: dict) -> str:
+    tpl = (TPL_DIR / name).read_text(encoding="utf-8")
+    return render_text(tpl, ctx)
+
+
+def page(title: str, content_name: str, ctx: dict) -> str:
+    ctx.setdefault("flash", "")
+    ctx["css"] = _CSS
+    content = render_template(content_name, ctx)
+    return render_template("layout.html", {"title": title, "css": _CSS, "content": content})
+
+
+def _json_body(handler) -> dict:
+    length = int(handler.headers.get("Content-Length") or 0)
+    raw = handler.rfile.read(length) if length else b"{}"
+    try:
+        data = json.loads(raw.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        # 兼容普通表单
+        data = {k: v[0] for k, v in parse_qs(raw.decode("utf-8")).items()}
+    if not isinstance(data, dict):
+        raise services.DomainError("请求体必须是 JSON 对象")
+    return data
+
+
+def _form(handler) -> dict:
+    length = int(handler.headers.get("Content-Length") or 0)
+    raw = handler.rfile.read(length).decode("utf-8") if length else ""
+    return {k: v[0] for k, v in parse_qs(raw, keep_blank_values=True).items()}
+
+
+def _jloads_field(form: dict, key: str, default):
+    raw = form.get(key, "")
+    if not str(raw).strip():
+        return default
+    return json.loads(raw)
+
+
+def _short(h: str, n=12) -> str:
+    return (h or "")[:n]
+
+
+def _ver_context(v: dict) -> dict:
+    return {
+        "version_id": v["version_id"], "semver": v["semver"], "status": v["status"],
+        "is_active": v["is_active"], "content_hash": v["content_hash"],
+        "short_hash": _short(v["content_hash"]),
+        "contract_change": v["contract_change"], "permission_expanded": v["permission_expanded"],
+        "pass_rate": v["pass_rate"], "created_at": v["created_at"],
+        "model_id": json.loads(v["model_params"]).get("_bound_model", ""),
+        "tools": json.loads(v["tool_permissions"]),
+        "contract": json.loads(v["variable_contract"]),
+    }
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "PromptGov/1.0"
+
+    def log_message(self, fmt, *args):  # 安静日志
+        pass
+
+    # ------------------------------------------------------------ 工具
+    def _send(self, code: int, body: bytes, ctype: str, extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj, ensure_ascii=False, indent=2).encode(),
+                   "application/json; charset=utf-8")
+
+    def _html(self, html_text: str, code=200):
+        self._send(code, html_text.encode("utf-8"), "text/html; charset=utf-8")
+
+    def _redirect(self, location: str):
+        self._send(HTTPStatus.SEE_OTHER, b"", "text/plain", {"Location": location})
+
+    def _err(self, exc: Exception):
+        if isinstance(exc, services.NotFound):
+            code = 404
+        elif isinstance(exc, services.Conflict):
+            code = 409
+        elif isinstance(exc, services.DomainError):
+            code = 400
+        else:
+            code = 500
+            traceback.print_exc()
+        self._json({"error": type(exc).__name__, "message": str(exc)}, code)
+
+    # ------------------------------------------------------------ 路由
+    def do_GET(self):  # noqa: N802
+        try:
+            self._route("GET")
+        except Exception as exc:  # noqa: BLE001
+            if getattr(self, "_is_page", False):
+                code = 404 if isinstance(exc, services.NotFound) else 500
+                self._html(page("出错", "error.html", {"message": str(exc),
+                                                       "kind": type(exc).__name__}), code)
+            else:
+                self._err(exc)
+
+    def do_POST(self):  # noqa: N802
+        try:
+            self._route("POST")
+        except Exception as exc:  # noqa: BLE001
+            if getattr(self, "_is_page", False):
+                referer = self.headers.get("Referer", "/")
+                self._redirect(referer.split("?")[0] + "?err=" + quote(str(exc)[:200]))
+            else:
+                self._err(exc)
+
+    def _route(self, method: str):
+        self._is_page = False
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        q = parse_qs(parsed.query)
+        p = path
+
+        # ------------------------------------------------ 页面
+        if method == "GET" and p == "/":
+            return self._page_dashboard(q)
+        m = re.fullmatch(r"/families/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._page_family(m.group(1), q)
+        m = re.fullmatch(r"/versions/([\w.-]+)/eval", p)
+        if method == "GET" and m:
+            return self._page_eval(m.group(1), q)
+        m = re.fullmatch(r"/requests/([\w.-]+)/replay", p)
+        if method == "GET" and m:
+            return self._page_replay(m.group(1), q)
+        m = re.fullmatch(r"/families/([\w.-]+)/rollout", p)
+        if method == "GET" and m:
+            return self._page_rollout(m.group(1), q)
+
+        # ------------------------------------------------ UI 表单动作
+        if method == "POST" and re.fullmatch(r"/ui/families/[\w.-]+/versions", p):
+            return self._ui_create_version(p.split("/")[3])
+        if method == "POST" and re.fullmatch(r"/ui/versions/[\w.-]+/eval-start", p):
+            return self._ui_eval_start(p.split("/")[3])
+        if method == "POST" and re.fullmatch(r"/ui/eval-runs/[\w.-]+/run", p):
+            return self._ui_eval_run(p.split("/")[3])
+        if method == "POST" and re.fullmatch(r"/ui/versions/[\w.-]+/approve", p):
+            return self._ui_approve(p.split("/")[3])
+        if method == "POST" and re.fullmatch(r"/ui/families/[\w.-]+/(promote|rollback)", p):
+            fid = p.split("/")[3]
+            return self._ui_promote_rollback(fid, p.split("/")[-1])
+        if method == "POST" and re.fullmatch(r"/ui/families/[\w.-]+/invoke", p):
+            return self._ui_invoke(p.split("/")[3])
+        if method == "POST" and re.fullmatch(r"/ui/families/[\w.-]+/rollouts", p):
+            return self._ui_create_rollout(p.split("/")[3])
+        if method == "POST" and \
+                re.fullmatch(r"/ui/rollouts/[\w.-]+/(ramp|freeze|resume|complete|cancel)", p):
+            return self._ui_rollout_action(p.split("/")[3], p.split("/")[-1])
+        if method == "POST" and re.fullmatch(r"/ui/requests/[\w.-]+/replay", p):
+            return self._ui_replay(p.split("/")[3])
+        if method == "POST" and p == "/ui/families":
+            return self._ui_create_family()
+
+        # ------------------------------------------------ JSON API
+        if method == "GET" and p == "/api/models":
+            return self._json(llm.list_models())
+        if method == "GET" and p == "/api/families":
+            return self._json(services.list_families())
+        if method == "POST" and p == "/api/families":
+            b = _json_body(self)
+            return self._json(services.create_family(
+                b["family_id"], b["name"], b.get("description", ""), b.get("actor", "api")), 201)
+        if method == "GET" and p == "/api/audit":
+            return self._json(services.audit_log(int(q.get("limit", ["100"])[0])))
+
+        m = re.fullmatch(r"/api/families/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._json(services.get_family(m.group(1)))
+        m = re.fullmatch(r"/api/families/([\w.-]+)/versions", p)
+        if m:
+            fid = m.group(1)
+            if method == "GET":
+                return self._json(services.list_versions(fid))
+            b = _json_body(self)
+            v = services.create_version(
+                fid, b["semver"], b["system_instruction"], b["variable_contract"],
+                b.get("tool_permissions", []), b.get("model_params", {}),
+                b["model_id"], b.get("actor", "api"))
+            return self._json(v, 201)
+        m = re.fullmatch(r"/api/families/([\w.-]+)/invoke", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            return self._json(services.invoke(m.group(1), b["inputs"],
+                                              b.get("actor", "api"),
+                                              b.get("request_id"),
+                                              b.get("routing_key")), 201)
+        m = re.fullmatch(r"/api/families/([\w.-]+)/rollouts", p)
+        if m:
+            fid = m.group(1)
+            if method == "GET":
+                return self._json(services.list_rollouts(fid))
+            b = _json_body(self)
+            return self._json(services.create_rollout(
+                fid, b["candidate_version_id"], int(b.get("weight", 10)),
+                b.get("actor", "api")), 201)
+        m = re.fullmatch(r"/api/families/([\w.-]+)/(promote|rollback)", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            fid, action = m.group(1), m.group(2)
+            if action == "promote":
+                res = services.promote(fid, b["version_id"], b.get("actor", "api"),
+                                       b.get("expected_active"))
+            else:
+                res = services.rollback(fid, b["target_version_id"], b.get("actor", "api"),
+                                        b.get("expected_active"))
+            return self._json(res)
+
+        m = re.fullmatch(r"/api/versions/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._json(services.get_version(m.group(1)))
+        m = re.fullmatch(r"/api/versions/[\w.-]+/eval/start", p)
+        if method == "POST" and m:
+            vid = p.split("/")[3]
+            run_id = services.start_evaluation(vid, "api")
+            return self._json({"run_id": run_id}, 202)
+        m = re.fullmatch(r"/api/eval-runs/([\w.-]+)/run", p)
+        if method == "POST" and m:
+            return self._json(services.run_evaluation(m.group(1), "api"))
+        m = re.fullmatch(r"/api/versions/([\w.-]+)/eval-runs", p)
+        if method == "GET" and m:
+            return self._json(services.list_eval_runs(m.group(1)))
+        m = re.fullmatch(r"/api/versions/([\w.-]+)/approve", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            return self._json(services.approve(m.group(1), b["kind"], b.get("approver", "api"),
+                                               b.get("decision", "approved"),
+                                               b.get("reason", "")), 201)
+        m = re.fullmatch(r"/api/eval-runs/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._json(services.get_eval_run(m.group(1)))
+        m = re.fullmatch(r"/api/rollouts/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._json(services.get_rollout(m.group(1)))
+        m = re.fullmatch(r"/api/rollouts/([\w.-]+)/(ramp|freeze|resume|complete|cancel)", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            rid, action = m.group(1), m.group(2)
+            gen = b.get("expected_generation")
+            if gen is None:
+                raise services.DomainError("必须提供 expected_generation 做原子冲突控制")
+            actor = b.get("actor", "api")
+            if action == "ramp":
+                if "weight" not in b:
+                    raise services.DomainError("升档必须提供 weight")
+                res = services.ramp_rollout(rid, int(b["weight"]), int(gen), actor)
+            elif action == "freeze":
+                res = services.freeze_rollout(rid, int(gen), actor)
+            elif action == "resume":
+                res = services.resume_rollout(rid, int(gen), actor)
+            elif action == "complete":
+                res = services.complete_rollout(rid, int(gen), actor)
+            else:
+                res = services.cancel_rollout(rid, int(gen), actor)
+            return self._json(res)
+        m = re.fullmatch(r"/api/requests/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._json(services.get_request(m.group(1)))
+        m = re.fullmatch(r"/api/requests/([\w.-]+)/replays", p)
+        if method == "GET" and m:
+            return self._json(services.list_replays(m.group(1)))
+        m = re.fullmatch(r"/api/requests/([\w.-]+)/replay", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            return self._json(services.replay(
+                m.group(1), b.get("actor", "api"), b.get("override_version_id"),
+                b.get("override_model_id"), b.get("override_inputs"),
+                bool(b.get("inject_drift", False))), 201)
+        if method == "GET" and p == "/api/requests":
+            return self._json(services.list_requests(q.get("family", [None])[0]))
+
+        self._json({"error": "NotFound", "message": f"无此路由: {method} {p}"}, 404)
+
+    # ============================================================ 页面渲染
+    def _flash(self, q) -> str:
+        return unquote(q.get("err", [""])[0])
+
+    def _page_dashboard(self, q):
+        self._is_page = True
+        families = services.list_families()
+        rows = []
+        for f in families:
+            versions = services.list_versions(f["family_id"])
+            active = next((v for v in versions if v["is_active"]), None)
+            ro = services.current_rollout(f["family_id"])
+            if ro:
+                cand = next((v for v in versions
+                             if v["version_id"] == ro["candidate_version_id"]), None)
+                ro = {**ro, "candidate_semver": cand["semver"] if cand else "?"}
+            rows.append({"family_id": f["family_id"], "name": f["name"],
+                         "description": f["description"],
+                         "active": _ver_context(active) if active else None,
+                         "rollout": ro,
+                         "n_versions": len(versions)})
+        ctx = {"families": rows, "models": llm.list_models(),
+               "flash": self._flash(q), "audit": services.audit_log(12)}
+        self._html(page("模板治理 · 总览", "dashboard.html", ctx))
+
+    def _page_family(self, fid, q):
+        self._is_page = True
+        family = services.get_family(fid)
+        versions = [_ver_context(v) for v in services.list_versions(fid)]
+        versions.sort(key=lambda v: v["created_at"], reverse=True)
+        active = next((v for v in versions if v["is_active"]), None)
+        # 视图层预算操作标志（受限模板表达式不支持 and/!= 等复合布尔）
+        for v in versions:
+            v["can_promote"] = (not v["is_active"] and
+                                v["status"] in ("evaluated", "approved", "failed_eval"))
+            v["can_rollback"] = (v["status"] == "superseded")
+            v["active_id_or_empty"] = active["version_id"] if active else ""
+        # 新建版本默认值：从当前线上版本预填
+        defaults = {"semver": "", "system_instruction": "", "contract": "{}",
+                    "tools": "", "params": json.dumps(
+                        {"temperature": 0.2, "top_p": 0.9, "max_tokens": 1024},
+                        ensure_ascii=False, indent=2)}
+        if active:
+            av = services.get_version(active["version_id"])
+            defaults.update({
+                "semver": _bump(active["semver"]),
+                "system_instruction": av["system_instruction"],
+                "contract": json.dumps(json.loads(av["variable_contract"]),
+                                       ensure_ascii=False, indent=2),
+                "tools": ", ".join(json.loads(av["tool_permissions"])),
+                "params": json.dumps({k: val for k, val in json.loads(av["model_params"]).items()
+                                      if not k.startswith("_")}, ensure_ascii=False, indent=2),
+            })
+        testset = services.get_testset_for_family(fid)
+        case_count = 0
+        if testset:
+            case_count = get_conn().execute(
+                "SELECT COUNT(*) c FROM testcases WHERE testset_id=?",
+                (testset["testset_id"],)).fetchone()["c"]
+        requests = services.list_requests(fid, limit=8)
+        req_rows = [{"request_id": r["request_id"], "version_id": r["version_id"],
+                     "model_id": r["model_id"], "input_digest": _short(r["input_digest"]),
+                     "output_digest": _short(r["output_digest"]),
+                     "routing_key": r["routing_key"] or "",
+                     "rollout_generation": r["rollout_generation"],
+                     "created_at": r["created_at"]} for r in requests]
+        rollout = services.current_rollout(fid)
+        ctx = {"family": family, "versions": versions, "active": active,
+               "defaults": defaults, "models": llm.list_models(),
+               "testset_name": testset["name"] if testset else "（无）",
+               "case_count": case_count, "requests": req_rows,
+               "rollout": rollout,
+               "flash": self._flash(q)}
+        self._html(page(f"{family['name']} · 版本", "family.html", ctx))
+
+    def _page_eval(self, vid, q):
+        self._is_page = True
+        v = services.get_version(vid)
+        family = services.get_family(v["family_id"])
+        runs = services.list_eval_runs(vid)
+        runs.sort(key=lambda r: r["created_at"], reverse=True)
+        run_rows = []
+        cases = []
+        selected_id = q.get("run", [None])[0]
+        for r in runs:
+            run_rows.append({"run_id": r["run_id"], "status": r["status"],
+                             "model_id": r["model_id"], "pass_rate": r["pass_rate"],
+                             "passed": r["passed"], "total": r["total"],
+                             "late": r["late"], "created_at": r["created_at"],
+                             "selected": r["run_id"] == selected_id})
+        if selected_id:
+            detail = services.get_eval_run(selected_id)
+            cases = [{"name": c["name"], "ok": c["ok"], "detail": c["detail"],
+                      "input_digest": _short(c["input_digest"]),
+                      "output_digest": _short(c["output_digest"]),
+                      "rendered_prompt": c["rendered_prompt"], "output": c["output"]}
+                     for c in detail["cases"]]
+            cur_run = detail
+        elif runs:
+            detail = services.get_eval_run(runs[0]["run_id"])
+            cases = [{"name": c["name"], "ok": c["ok"], "detail": c["detail"],
+                      "input_digest": _short(c["input_digest"]),
+                      "output_digest": _short(c["output_digest"]),
+                      "rendered_prompt": c["rendered_prompt"], "output": c["output"]}
+                     for c in detail["cases"]]
+            cur_run = detail
+        else:
+            cur_run = None
+        approvals = services.list_approvals(vid)
+        vc = _ver_context(v)
+        ctx = {"v": vc, "family": family, "runs": run_rows, "cases": cases,
+               "cur_run": cur_run, "approvals": approvals,
+               "threshold": config.PASS_THRESHOLD, "flash": self._flash(q)}
+        self._html(page(f"评估 · {v['semver']}", "eval.html", ctx))
+
+    def _page_rollout(self, fid, q):
+        self._is_page = True
+        family = services.get_family(fid)
+        versions = {v["version_id"]: _ver_context(v)
+                    for v in services.list_versions(fid)}
+        rollouts = services.list_rollouts(fid)
+
+        def enrich(r):
+            cand = versions.get(r["candidate_version_id"])
+            base = versions.get(r["base_version_id"])
+            d = dict(r)
+            d["candidate_semver"] = cand["semver"] if cand else "?"
+            d["base_semver"] = base["semver"] if base else "?"
+            d["open"] = r["status"] in ("ramping", "frozen")
+            d["is_ramping"] = r["status"] == "ramping"
+            d["is_frozen"] = r["status"] == "frozen"
+            d["next_weight"] = min(100, r["weight"] + 10)
+            return d
+
+        rows = [enrich(r) for r in rollouts]
+        current = next((r for r in rows if r["open"]), None)
+        candidates = [{"version_id": v["version_id"], "semver": v["semver"],
+                       "status": v["status"], "short_hash": _short(v["content_hash"]),
+                       "model_id": json.loads(v["model_params"]).get("_bound_model", "")}
+                      for v in services.list_rollout_candidates(fid)]
+        requests = services.list_requests(fid, limit=10)
+        req_rows = [{"request_id": r["request_id"], "version_id": r["version_id"],
+                     "routing_key": r["routing_key"] or "",
+                     "rollout_generation": r["rollout_generation"],
+                     "hit_candidate": bool(current) and
+                     r["rollout_id"] == current["rollout_id"],
+                     "created_at": r["created_at"]} for r in requests]
+        ctx = {"family": family, "current": current, "rollouts": rows,
+               "candidates": candidates, "requests": req_rows,
+               "flash": self._flash(q)}
+        self._html(page(f"{family['name']} · 放量批次", "rollout.html", ctx))
+
+    def _page_replay(self, rid, q):
+        self._is_page = True
+        req = services.get_request(rid)
+        versions = [_ver_context(x) for x in services.list_versions(req["family_id"])]
+        family = services.get_family(req["family_id"])
+        replays = services.list_replays(rid)
+        rpl_rows = [{"replay_id": r["replay_id"], "mode": r["mode"], "verdict": r["verdict"],
+                     "changed_axis": r["changed_axis"], "same_template": r["same_template"],
+                     "same_model": r["same_model"], "same_input": r["same_input"],
+                     "same_output": r["same_output"], "created_at": r["created_at"]}
+                    for r in replays]
+        latest = services.replay  # noop ref
+        rollout = None
+        if req.get("rollout_id"):
+            try:
+                rollout = services.get_rollout(req["rollout_id"])
+            except services.NotFound:
+                rollout = None
+        ctx = {"req": {"request_id": rid, "family_id": req["family_id"],
+                       "family_name": family["name"], "version_id": req["version_id"],
+                       "model_id": req["model_id"],
+                       "input_digest": req["input_digest"],
+                       "output_digest": req["output_digest"],
+                       "template_hash": req["template_hash_at_call"],
+                       "short_template_hash": _short(req["template_hash_at_call"]),
+                       "inputs_json": json.dumps(json.loads(req["inputs_json"]),
+                                                 ensure_ascii=False, indent=2),
+                       "output": req["output"],
+                       "rendered_prompt": req["rendered_prompt"],
+                       "routing_key": req.get("routing_key") or "",
+                       "rollout_id": req.get("rollout_id") or "",
+                       "rollout_generation": req.get("rollout_generation"),
+                       "params_fingerprint": req.get("params_fingerprint") or "",
+                       "params_json": json.dumps(json.loads(req["params_json"]),
+                                                 ensure_ascii=False, indent=2)
+                       if req.get("params_json") else "",
+                       "created_at": req["created_at"]},
+               "rollout": rollout,
+               "versions": versions, "models": llm.list_models(),
+               "replays": rpl_rows, "result": None, "flash": self._flash(q)}
+        # 若带 ?rpl= 则展示该报告详情
+        rpl_id = q.get("rpl", [None])[0]
+        if rpl_id:
+            row = get_conn().execute("SELECT * FROM replays WHERE replay_id=?",
+                                     (rpl_id,)).fetchone()
+            if row:
+                ctx["result"] = {
+                    "verdict": row["verdict"], "mode": row["mode"],
+                    "changed_axis": row["changed_axis"],
+                    "same_template": row["same_template"], "same_model": row["same_model"],
+                    "same_input": row["same_input"], "same_output": row["same_output"],
+                    "replay_output": row["replay_output"]}
+        self._html(page("重演报告", "replay.html", ctx))
+
+    # ============================================================ UI 动作
+    def _ui_create_family(self):
+        self._is_page = True
+        f = _form(self)
+        services.create_family(f["family_id"].strip(), f["name"].strip(),
+                               f.get("description", ""), f.get("actor", "web") or "web")
+        self._redirect(f"/families/{f['family_id'].strip()}")
+
+    def _ui_create_version(self, fid):
+        self._is_page = True
+        f = _form(self)
+        contract = _jloads_field(f, "variable_contract", {})
+        tools = [t.strip() for t in f.get("tool_permissions", "").split(",") if t.strip()]
+        params = _jloads_field(f, "model_params", {})
+        v = services.create_version(
+            fid, f["semver"].strip(), f["system_instruction"], contract, tools, params,
+            f["model_id"], f.get("actor", "web") or "web")
+        self._redirect(f"/versions/{v['version_id']}/eval")
+
+    def _ui_eval_start(self, vid):
+        self._is_page = True
+        f = _form(self)
+        run_id = services.start_evaluation(vid, f.get("actor", "web") or "web")
+        self._redirect(f"/versions/{vid}/eval?run={run_id}")
+
+    def _ui_eval_run(self, run_id):
+        self._is_page = True
+        f = _form(self)
+        run = services.run_evaluation(run_id, f.get("actor", "web") or "web")
+        self._redirect(f"/versions/{run['version_id']}/eval?run={run_id}")
+
+    def _ui_approve(self, vid):
+        self._is_page = True
+        f = _form(self)
+        services.approve(vid, f["kind"], f.get("approver", "web") or "web",
+                         f.get("decision", "approved"), f.get("reason", ""))
+        self._redirect(f"/versions/{vid}/eval")
+
+    def _ui_promote_rollback(self, fid, action):
+        self._is_page = True
+        f = _form(self)
+        expected = f.get("expected_active") or None
+        if action == "promote":
+            services.promote(fid, f["version_id"], f.get("actor", "web") or "web", expected)
+        else:
+            services.rollback(fid, f["target_version_id"], f.get("actor", "web") or "web",
+                              expected)
+        self._redirect(f"/families/{fid}")
+
+    def _ui_invoke(self, fid):
+        self._is_page = True
+        f = _form(self)
+        inputs = _jloads_field(f, "inputs_json", {})
+        res = services.invoke(fid, inputs, f.get("actor", "web") or "web",
+                              routing_key=f.get("routing_key") or None)
+        self._redirect(f"/requests/{res['request_id']}/replay")
+
+    def _ui_create_rollout(self, fid):
+        self._is_page = True
+        f = _form(self)
+        services.create_rollout(fid, f["candidate_version_id"],
+                             int(f.get("weight") or 10), f.get("actor", "web") or "web")
+        self._redirect(f"/families/{fid}/rollout")
+
+    def _ui_rollout_action(self, rid, action):
+        self._is_page = True
+        f = _form(self)
+        gen = int(f["expected_generation"])
+        actor = f.get("actor", "web") or "web"
+        if action == "ramp":
+            ro = services.ramp_rollout(rid, int(f["weight"]), gen, actor)
+        elif action == "freeze":
+            ro = services.freeze_rollout(rid, gen, actor)
+        elif action == "resume":
+            ro = services.resume_rollout(rid, gen, actor)
+        elif action == "complete":
+            ro = services.complete_rollout(rid, gen, actor)
+        else:
+            ro = services.cancel_rollout(rid, gen, actor)
+        self._redirect(f"/families/{ro['family_id']}/rollout")
+
+    def _ui_replay(self, rid):
+        self._is_page = True
+        f = _form(self)
+        ov_version = f.get("override_version_id") or None
+        ov_model = f.get("override_model_id") or None
+        override_inputs = None
+        if f.get("change_inputs") == "1":
+            override_inputs = _jloads_field(f, "inputs_json", {})
+        inject = f.get("inject_drift") == "on"
+        res = services.replay(rid, f.get("actor", "web") or "web",
+                              ov_version, ov_model, override_inputs, inject)
+        self._redirect(f"/requests/{rid}/replay?rpl={res['replay_id']}")
+
+
+def _bump(semver: str) -> str:
+    parts = (semver.split(".") + ["0", "0", "0"])[:3]
+    try:
+        parts[2] = str(int(parts[2]) + 1)
+    except ValueError:
+        return ""
+    return ".".join(parts)
+
+
+def build_server() -> ThreadingHTTPServer:
+    init_db()
+    if config.SEED:
+        from . import seed  # 延迟导入
+        seed.run()
+    return ThreadingHTTPServer((config.HOST, config.PORT), Handler)
+
+
+def main():
+    httpd = build_server()
+    print(f"PromptGov 服务已启动: http://{config.HOST}:{config.PORT}")
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

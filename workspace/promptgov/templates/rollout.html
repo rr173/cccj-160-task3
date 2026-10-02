@@ -2,6 +2,7 @@
 
 <div class="note">
   <a href="/families/{{ family.family_id }}">← 返回 {{ family.name }}</a> ·
+  <a href="/families/{{ family.family_id }}/guard"><b>自动止损（配置/触发历史/回执流水）→</b></a><br>
   分批放量：调用方携带 <span class="mono">routing_key</span>，系统用稳定散列把
   <span class="mono">(批次, key)</span> 映射到 0~99 号桶，桶号 &lt; 权重时走<b>候选构件</b>，
   否则走<b>当前构件</b>。批次代次不变时同一 key 的路由决定不漂移；
@@ -24,6 +25,13 @@
     <div>分流权重</div><div><b>{{ current.weight }}%</b> 的 key 走候选，其余走当前构件</div>
     <div>批次代次</div><div class="mono">{{ current.generation }}</div>
     <div>创建</div><div>{{ current.created_at }} · {{ current.created_by }}</div>
+    {% if guard %}
+    <div>自动止损</div><div>窗口 {{ guard.window_seconds }}s · 样本≥{{ guard.min_samples }} ·
+      失败占比&gt;{{ guard.max_fail_ratio }} 即冻结回基线
+      {% if guard_stats %}<span class="chip">当前窗口 {{ guard_stats.samples }} 样本 /
+        {{ guard_stats.failures }} 失败</span>{% endif %}
+      <a href="/families/{{ family.family_id }}/guard">止损详情 →</a></div>
+    {% endif %}
   </div>
 
   <div class="grid g3" style="margin-top:14px">

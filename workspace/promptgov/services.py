@@ -1,4 +1,4 @@
-"""服务层：模板版本治理、评估证据、审批、原子发布/回滚、线上调用、重演。"""
+"""服务层：模板版本治理、评估证据、审批、原子发布/回滚、分批放量、自动止损、线上调用、重演。"""
 from __future__ import annotations
 
 import json
@@ -528,7 +528,7 @@ def list_rollout_candidates(family_id: str) -> list[dict]:
 
 
 def create_rollout(family_id: str, candidate_version_id: str, weight: int,
-                   actor: str) -> dict:
+                   actor: str, guard: dict | None = None) -> dict:
     """为已审核构件建立带权重的放量批次。
 
     门禁（与发布同标准，全部在单事务内校验）：
@@ -537,10 +537,17 @@ def create_rollout(family_id: str, candidate_version_id: str, weight: int,
     3. 候选相对线上新增可调用工具时，必须已存在覆盖该工具集的 tool_expansion
        专项授权——保证首个请求命中候选之前授权已就位；
     4. 同族无其他进行中批次。
+
+    可选 guard={"window_seconds","min_samples","max_fail_ratio"} 同事务配置自动止损。
     """
     if not (0 <= int(weight) <= 100):
         raise DomainError("权重必须是 0~100 的整数（候选流量百分比）")
     weight = int(weight)
+    guard_cfg = None
+    if guard is not None:
+        guard_cfg = _validate_guard(guard.get("window_seconds"),
+                                    guard.get("min_samples"),
+                                    guard.get("max_fail_ratio"))
     f = _family_row(family_id)
     if not f["active_version_id"]:
         raise Conflict("该模板族尚未发布线上版本，无法建立放量批次（缺少当前构件作对照）")
@@ -584,9 +591,17 @@ def create_rollout(family_id: str, candidate_version_id: str, weight: int,
                VALUES (?,?,?,?,?, 'ramping', 1, ?)""",
             (rollout_id, family_id, candidate_version_id, f["active_version_id"],
              weight, actor))
+        if guard_cfg:
+            c.execute(
+                """INSERT INTO rollout_guards(guard_id,rollout_id,window_seconds,
+                   min_samples,max_fail_ratio,enabled,created_by)
+                   VALUES (?,?,?,?,?, 1, ?)""",
+                (_uid("grd"), rollout_id, *guard_cfg, actor))
         audit(actor, "rollout.create", "rollout", rollout_id,
               f"family={family_id} candidate={candidate_version_id} "
-              f"base={f['active_version_id']} weight={weight}%")
+              f"base={f['active_version_id']} weight={weight}%"
+              + (f" guard=({guard_cfg[0]}s/{guard_cfg[1]}/{guard_cfg[2]})"
+                 if guard_cfg else ""))
     return get_rollout(rollout_id)
 
 
@@ -705,6 +720,263 @@ def cancel_rollout(rollout_id: str, expected_generation: int, actor: str) -> dic
         audit(actor, "rollout.cancel", "rollout", rollout_id,
               f"撤销放量，流量回归当前构件 {r['base_version_id']}")
     return get_rollout(rollout_id)
+
+
+# ================================================================ 自动止损（效果回执）
+
+FEEDBACK_OUTCOMES = ("success", "failure")
+
+
+def _validate_guard(window_seconds, min_samples, max_fail_ratio) -> tuple:
+    """规范化并校验止损三要素：观察窗口（秒）、最小样本量、失败占比上限。"""
+    try:
+        window_seconds = int(window_seconds)
+        min_samples = int(min_samples)
+        max_fail_ratio = float(max_fail_ratio)
+    except (TypeError, ValueError):
+        raise DomainError("止损配置类型错误：window_seconds/min_samples 为整数，"
+                          "max_fail_ratio 为数值")
+    if window_seconds < 1:
+        raise DomainError("观察窗口 window_seconds 必须 ≥ 1 秒")
+    if min_samples < 1:
+        raise DomainError("最小样本量 min_samples 必须 ≥ 1")
+    if not (0.0 <= max_fail_ratio < 1.0):
+        raise DomainError("失败占比上限 max_fail_ratio 必须在 [0,1) 之间（越过即触发）")
+    return window_seconds, min_samples, max_fail_ratio
+
+
+def set_rollout_guard(rollout_id: str, window_seconds, min_samples, max_fail_ratio,
+                      actor: str, enabled: int = 1) -> dict:
+    """为一次试投配置/更新自动止损（upsert，每批次一条）。
+
+    配置作用于当前及之后代次的回执统计；历史触发快照中固化的是触发当时的
+    配置值，更新配置不回溯改写历史。
+    """
+    ws, ms, mfr = _validate_guard(window_seconds, min_samples, max_fail_ratio)
+    enabled = 1 if int(enabled) else 0
+    with write_tx() as c:
+        r = c.execute("SELECT * FROM rollouts WHERE rollout_id=?",
+                      (rollout_id,)).fetchone()
+        if not r:
+            raise NotFound(f"放量批次不存在: {rollout_id}")
+        existing = c.execute("SELECT * FROM rollout_guards WHERE rollout_id=?",
+                             (rollout_id,)).fetchone()
+        if existing:
+            c.execute(
+                """UPDATE rollout_guards SET window_seconds=?, min_samples=?,
+                   max_fail_ratio=?, enabled=?, updated_at=datetime('now')
+                   WHERE rollout_id=?""",
+                (ws, ms, mfr, enabled, rollout_id))
+            action = "guard.update"
+        else:
+            c.execute(
+                """INSERT INTO rollout_guards(guard_id,rollout_id,window_seconds,
+                   min_samples,max_fail_ratio,enabled,created_by)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (_uid("grd"), rollout_id, ws, ms, mfr, enabled, actor))
+            action = "guard.create"
+        audit(actor, action, "rollout", rollout_id,
+              f"window={ws}s min_samples={ms} max_fail_ratio={mfr} enabled={enabled}")
+    return get_rollout_guard(rollout_id)
+
+
+def get_rollout_guard(rollout_id: str) -> dict | None:
+    row = get_conn().execute("SELECT * FROM rollout_guards WHERE rollout_id=?",
+                             (rollout_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def _window_stats(c, rollout_id: str, generation: int, window_seconds: int) -> dict:
+    """当前代次、滑动窗口内的入账回执统计（只数 counted=1）。"""
+    row = c.execute(
+        """SELECT COUNT(*) AS samples,
+           COALESCE(SUM(CASE WHEN outcome='failure' THEN 1 ELSE 0 END), 0) AS failures
+           FROM feedback_receipts
+           WHERE rollout_id=? AND generation=? AND counted=1
+           AND created_at >= datetime('now', ?)""",
+        (rollout_id, generation, f"-{int(window_seconds)} seconds")).fetchone()
+    return {"samples": row["samples"], "failures": row["failures"]}
+
+
+def guard_status(rollout_id: str) -> dict:
+    """止损配置 + 当前代次窗口实时统计（供 API 与止损页面）。"""
+    rollout = _rollout_row(rollout_id)
+    guard = get_rollout_guard(rollout_id)
+    stats = None
+    if guard and guard["enabled"]:
+        stats = _window_stats(get_conn(), rollout_id, rollout["generation"],
+                              guard["window_seconds"])
+        samples = stats["samples"]
+        ratio = stats["failures"] / samples if samples else 0.0
+        stats["fail_ratio"] = ratio
+        stats["min_reached"] = samples >= guard["min_samples"]
+        stats["over_cap"] = stats["min_reached"] and ratio > guard["max_fail_ratio"]
+    return {"rollout": dict(rollout), "guard": guard, "stats": stats}
+
+
+def submit_feedback(request_id: str, feedback_id: str, outcome: str,
+                    actor: str, note: str = "") -> dict:
+    """生产效果回执：同一 feedback_id 只入账一次；命中本代次候选才计数并可能触发止损。
+
+    分类（disposition）：
+    - counted：请求真实由该试投本代次产生且命中候选构件，批次放量中、止损已启用
+      ——计入窗口统计；
+    - unknown_request / not_candidate：无关请求或未命中候选构件——仅审计；
+    - stale_generation / rollout_inactive：旧代次（迟到）或批次已离开放量态——仅审计；
+    - no_guard / guard_disabled / request_already_counted：不计数——仅审计。
+
+    触发：窗口内样本达到门槛且失败占比越过上限时，在同一写事务内
+    冻结试投（新流量导回基线）+ 代次 CAS + 落触发快照；写事务串行化保证
+    并发越界回执只让状态变化一次。
+    """
+    request_id = (request_id or "").strip()
+    feedback_id = (feedback_id or "").strip()
+    if not request_id or not feedback_id:
+        raise DomainError("必须提供 request_id 与 feedback_id")
+    if outcome not in FEEDBACK_OUTCOMES:
+        raise DomainError("outcome 必须是 success 或 failure")
+
+    triggered = None
+    with write_tx() as c:  # 立即写锁：回执入账与止损判定串行化
+        dup = c.execute("SELECT * FROM feedback_receipts WHERE feedback_id=?",
+                        (feedback_id,)).fetchone()
+        if dup:
+            # 幂等：重复回执直接返回首次入账结果，不产生任何状态变化
+            return _feedback_payload(dict(dup), duplicate=True, triggered=None)
+
+        req = c.execute("SELECT * FROM requests WHERE request_id=?",
+                        (request_id,)).fetchone()
+        rollout = None
+        if req and req["rollout_id"]:
+            rollout = c.execute("SELECT * FROM rollouts WHERE rollout_id=?",
+                                (req["rollout_id"],)).fetchone()
+        family_id = req["family_id"] if req else None
+        rollout_id = req["rollout_id"] if req else None
+        generation = req["rollout_generation"] if req else None
+        counted = 0
+
+        if not req:
+            disposition = "unknown_request"
+        elif not rollout:
+            # 未参与试投（基线流量/无批次），或批次引用异常
+            disposition = "not_candidate"
+        elif req["version_id"] != rollout["candidate_version_id"]:
+            disposition = "not_candidate"
+        elif generation != rollout["generation"]:
+            disposition = "stale_generation"   # 旧代次：迟到回执
+        elif rollout["status"] != "ramping":
+            disposition = "rollout_inactive"
+        else:
+            guard = c.execute("SELECT * FROM rollout_guards WHERE rollout_id=?",
+                              (rollout_id,)).fetchone()
+            if not guard:
+                disposition = "no_guard"
+            elif not guard["enabled"]:
+                disposition = "guard_disabled"
+            elif c.execute("SELECT 1 FROM feedback_receipts "
+                           "WHERE request_id=? AND counted=1",
+                           (request_id,)).fetchone():
+                disposition = "request_already_counted"  # 一个请求只贡献一个样本
+            else:
+                counted = 1
+                disposition = "counted"
+
+        c.execute(
+            """INSERT INTO feedback_receipts(feedback_id,request_id,family_id,
+               rollout_id,generation,outcome,counted,disposition,note,actor)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (feedback_id, request_id, family_id, rollout_id, generation,
+             outcome, counted, disposition, note or "", actor))
+
+        if counted:
+            stats = _window_stats(c, rollout_id, generation, guard["window_seconds"])
+            samples, failures = stats["samples"], stats["failures"]
+            ratio = failures / samples if samples else 0.0
+            if samples >= guard["min_samples"] and ratio > guard["max_fail_ratio"]:
+                # 单事务止损：冻结试投（新流量导回基线）+ 代次 CAS + 触发快照。
+                # 写事务串行化 + CAS：并发越界回执只有第一张看到 ramping 并完成切换。
+                _cas_transition(c, rollout_id, generation, "status='frozen'",
+                                (), ("ramping",))
+                event_id = _uid("ge")
+                c.execute(
+                    """INSERT INTO guard_events(event_id,rollout_id,generation,
+                       trigger_feedback_id,window_seconds,min_samples,max_fail_ratio,
+                       samples,failures,fail_ratio,action)
+                       VALUES (?,?,?,?,?,?,?,?,?,?, 'freeze')""",
+                    (event_id, rollout_id, generation, feedback_id,
+                     guard["window_seconds"], guard["min_samples"],
+                     guard["max_fail_ratio"], samples, failures, ratio))
+                triggered = {"event_id": event_id, "action": "freeze",
+                             "samples": samples, "failures": failures,
+                             "fail_ratio": ratio}
+                audit(actor, "guard.trigger", "rollout", rollout_id,
+                      f"止损触发：窗口 {guard['window_seconds']}s 内 {failures}/{samples} "
+                      f"失败（{ratio:.2%} > {guard['max_fail_ratio']:.2%}），冻结试投并导回基线，"
+                      f"代次 {generation} -> {generation + 1}")
+        audit(actor, "feedback.submit", "feedback", feedback_id,
+              f"request={request_id} outcome={outcome} disposition={disposition}"
+              + (f" rollout={rollout_id}@gen{generation}" if rollout_id else ""))
+        row = c.execute("SELECT * FROM feedback_receipts WHERE feedback_id=?",
+                        (feedback_id,)).fetchone()
+    return _feedback_payload(dict(row), duplicate=False, triggered=triggered)
+
+
+def _feedback_payload(row: dict, duplicate: bool, triggered: dict | None) -> dict:
+    return {
+        "feedback_id": row["feedback_id"], "request_id": row["request_id"],
+        "family_id": row["family_id"], "rollout_id": row["rollout_id"],
+        "generation": row["generation"], "outcome": row["outcome"],
+        "counted": row["counted"], "disposition": row["disposition"],
+        "note": row["note"], "duplicate": duplicate, "triggered": triggered,
+        "created_at": row["created_at"],
+    }
+
+
+def get_feedback(feedback_id: str) -> dict:
+    row = get_conn().execute("SELECT * FROM feedback_receipts WHERE feedback_id=?",
+                             (feedback_id,)).fetchone()
+    if not row:
+        raise NotFound(f"回执不存在: {feedback_id}")
+    return dict(row)
+
+
+def list_feedback(family_id: str | None = None, rollout_id: str | None = None,
+                  request_id: str | None = None, generation: int | None = None,
+                  limit: int = 50) -> list[dict]:
+    clauses, args = [], []
+    if family_id:
+        clauses.append("family_id=?")
+        args.append(family_id)
+    if rollout_id:
+        clauses.append("rollout_id=?")
+        args.append(rollout_id)
+    if request_id:
+        clauses.append("request_id=?")
+        args.append(request_id)
+    if generation is not None:
+        clauses.append("generation=?")
+        args.append(int(generation))
+    q = "SELECT * FROM feedback_receipts"
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
+    q += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+    return [dict(r) for r in get_conn().execute(q, (*args, int(limit))).fetchall()]
+
+
+def list_guard_events(rollout_id: str | None = None,
+                      family_id: str | None = None) -> list[dict]:
+    """止损触发历史（快照）。可按批次或按族查询，人工恢复后旧窗口记录仍可复核。"""
+    if rollout_id:
+        q = "SELECT * FROM guard_events WHERE rollout_id=? ORDER BY created_at DESC, rowid DESC"
+        args: tuple = (rollout_id,)
+    elif family_id:
+        q = ("SELECT g.* FROM guard_events g JOIN rollouts r ON r.rollout_id=g.rollout_id "
+             "WHERE r.family_id=? ORDER BY g.created_at DESC, g.rowid DESC")
+        args = (family_id,)
+    else:
+        q = "SELECT * FROM guard_events ORDER BY created_at DESC, rowid DESC"
+        args = ()
+    return [dict(r) for r in get_conn().execute(q, args).fetchall()]
 
 
 # ================================================================ 线上调用

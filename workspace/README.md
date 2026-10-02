@@ -18,6 +18,10 @@
 - **分批放量**：已审核构件可建立带权重的放量批次，调用方携带 `routing_key`，
   系统用稳定散列决定走当前构件还是候选构件；批次代次不变时同键路由不漂移。
   批次支持升档 / 冻结 / 恢复 / 完成 / 撤销，全部以 `expected_generation` 做 CAS。
+- **自动止损**：业务方为一次试投设置观察窗口、最小样本量与失败占比上限；
+  生产回执按 `request_id + feedback_id` 上报（同 `feedback_id` 只入账一次）。
+  窗口内样本达标且失败占比越限时，系统在**单事务**内冻结试投、把新流量导回基线
+  并保存触发快照；人工恢复开启新代次并重置统计窗口。
 
 ## 运行
 
@@ -28,8 +32,30 @@ python3 -m promptgov
 ```
 
 首启自动建表并灌入演示数据：模板族 `support-router`，线上 v1，候选
-v1.1.0（已建 20% 权重放量批次）、v1.2.0（扩大了 `refund.execute`，缺专项审批，
-建放量批次与发布都会被门禁拦下）、v1.3.0（绑定弱模型 mini，评估 0.5 不达标）。
+v1.1.0（已建 20% 权重放量批次，并配置止损：窗口 900s / 样本≥5 / 失败占比>40% 触发）、
+v1.2.0（扩大了 `refund.execute`，缺专项审批，建放量批次与发布都会被门禁拦下）、
+v1.3.0（绑定弱模型 mini，评估 0.5 不达标）。
+
+## 自动止损（效果回执）
+
+- **配置**：每个批次一条止损规则（`rollout_guards`，upsert）：`window_seconds`
+  滑动观察窗口、`min_samples` 最小样本量、`max_fail_ratio` 失败占比上限 [0,1)。
+  建批时可一并传入 `guard={...}`，也可事后 `POST /api/rollouts/{rid}/guard`。
+- **回执**：`POST /api/feedback` 携带 `request_id + feedback_id + outcome`
+  （success/failure）。`feedback_id` 是幂等键：重复上报返回首次入账结果（HTTP 200，
+  `duplicate=true`），不重复计数、不触发任何状态变化。
+- **入账规则**：只有"请求真实由该试投**本代次**产生且命中候选构件、批次放量中、
+  止损已启用、该请求尚未入账过"的回执才 `counted=1` 计入统计；其余一律
+  `counted=0` 仅留审计（`disposition` 区分：`unknown_request` / `not_candidate` /
+  `stale_generation` / `rollout_inactive` / `no_guard` / `guard_disabled` /
+  `request_already_counted`）。旧代次与无关请求的回执永不触发状态变化。
+- **触发**：窗口内 `samples ≥ min_samples` 且 `failures/samples > max_fail_ratio`
+  （越过才算，等于不触发）时，在**同一写事务**内：冻结试投（`ramping→frozen`，
+  新流量全部导回基线构件）+ 代次 CAS（generation+1）+ 落触发快照
+  （`guard_events`：窗口统计、当时配置、触发回执）。写事务串行化保证并发越界
+  回执只让状态变化一次。
+- **人工恢复**：`resume` 开启新代次，统计窗口随之重置（统计按代次隔离）；
+  旧代次回执、触发快照与历史请求全部保留，可随时复核。
 
 ## 分批放量
 
@@ -66,6 +92,11 @@ v1.1.0（已建 20% 权重放量批次）、v1.2.0（扩大了 `refund.execute`�
 | 放量同键稳定 | 路由桶号只依赖 `(rollout_id, routing_key)` 的稳定散列，不含权重/代次 |
 | 放量并发只一胜 | 批次切换带 `expected_generation` 做代次 CAS，冲突 409 且路由表不变 |
 | 调用可复查 | `requests` 固化命中构件/推理配置/参数指纹/批次代次；复查不读当前批次状态 |
+| 回执幂等 | `feedback_id` 主键去重：重复上报返回首次入账结果，不重复计数、不触发 |
+| 回执归属严格 | 仅本代次+命中候选+放量中的回执计数；旧代次/无关请求 `counted=0` 仅审计 |
+| 止损单事务 | 越限判定、冻结试投、代次 CAS、触发快照在同一 `BEGIN IMMEDIATE` 事务内 |
+| 止损并发只一胜 | 写事务串行化：并发越界回执只有一张看到 ramping 并完成切换（压测：6 并发，1 触发 5 迟到）|
+| 恢复即重置 | 人工恢复开启新代次，统计按 `(rollout_id, generation)` 隔离，旧窗口天然归零 |
 | 权限扩大重新审批 | 相对线上基线新增工具即要求覆盖该工具集的 `tool_expansion` approved；回滚只收窄故免新审批 |
 | 契约升级分级 | 删变量/加必填/改类型=breaking；仅加可选变量=compatible；网关按声明字段投影输入 |
 | 审计 | 所有生命周期动作写 `audit_log`（总览页可见） |
@@ -81,9 +112,12 @@ v1.1.0（已建 20% 权重放量批次）、v1.2.0（扩大了 `refund.execute`�
 - `/` 总览：模板族/线上版本（含放量中标记）、模型注册表、审计流。
 - `/families/{id}` 版本治理：建版本（四要素）、热发布/回滚、线上调用（可带 routing_key）、最近请求。
 - `/families/{id}/rollout` **放量操作页**：建批次、升档/冻结/恢复/完成/撤销、批次历史、最近命中。
+- `/families/{id}/guard` **自动止损页**：止损配置（窗口/样本门槛/失败占比上限）、
+  当前窗口实时统计、触发历史快照、回执流水（含仅审计的入账）。
 - `/versions/{id}/eval` **评估页面**：证据列表（含迟到标记）、逐用例渲染提示与输出、审批。
 - `/requests/{id}/replay` **调用复查页**：原三元组与放量命中证据（命中构件/批次代次/参数指纹/
-  推理配置快照）、精确重演、单轴反事实、漂移注入、历史重演记录与结论。
+  推理配置快照）、精确重演、单轴反事实、漂移注入、历史重演记录与结论、
+  该请求的效果回执（可在此上报成功/失败）。
 
 ## JSON API（摘要）
 
@@ -96,14 +130,20 @@ POST /api/families/{fid}/versions            # 四要素 + model_id
 POST /api/families/{fid}/invoke              # {inputs, routing_key?} 稳定散列分流
 POST /api/families/{fid}/promote             # {version_id, expected_active}
 POST /api/families/{fid}/rollback            # {target_version_id, expected_active}
-POST /api/families/{fid}/rollouts            # {candidate_version_id, weight} 建批次
+POST /api/families/{fid}/rollouts            # {candidate_version_id, weight, guard?} 建批次
 GET  /api/families/{fid}/rollouts
 GET  /api/rollouts/{rid}
 POST /api/rollouts/{rid}/ramp                # {weight, expected_generation} 升档
 POST /api/rollouts/{rid}/freeze              # {expected_generation} 冻结
-POST /api/rollouts/{rid}/resume              # {expected_generation} 恢复
+POST /api/rollouts/{rid}/resume              # {expected_generation} 恢复（人工恢复→新代次）
 POST /api/rollouts/{rid}/complete            # {expected_generation} 完成（候选转正）
 POST /api/rollouts/{rid}/cancel              # {expected_generation} 撤销（流量回归）
+GET  /api/rollouts/{rid}/guard               # 止损配置 + 当前窗口实时统计
+POST /api/rollouts/{rid}/guard               # {window_seconds, min_samples, max_fail_ratio, enabled?} upsert
+GET  /api/rollouts/{rid}/guard/events        # 触发历史（快照）
+GET  /api/rollouts/{rid}/feedback            # 该批次的回执流水
+POST /api/feedback                           # {request_id, feedback_id, outcome, note?} 回执（幂等）
+GET  /api/feedback/{feedback_id}             # 单条回执
 POST /api/versions/{vid}/eval/start
 POST /api/eval-runs/{rid}/run
 GET  /api/versions/{vid}/eval-runs
@@ -118,15 +158,20 @@ GET  /api/audit
 
 ## 代码地图
 
-- `db.py`：SQLite schema（含 `rollouts` 批次表与 `requests` 放量证据列）、WAL、
+- `db.py`：SQLite schema（含 `rollouts` 批次表、`requests` 放量证据列、`rollout_guards`
+  止损配置、`feedback_receipts` 回执、`guard_events` 触发快照）、WAL、
   `write_tx()` 立即写锁事务、审计、老库增量迁移。
 - `core.py`：内容/输入/输出哈希、参数指纹、放量稳定散列分桶、变量契约校验与升级分级、
   权限集合比较、受限渲染入口。
 - `jinja_compat.py`：零依赖沙箱模板（`{{ }}`、`{% if/for %}`、过滤器、比较/三元）。
 - `llm.py`：模型注册表 + 确定性假模型（输出由 model/template/input 三轴决定）+ 断言器。
 - `services.py`：版本生命周期、评估证据、审批、CAS 发布/回滚、分批放量
-  （建批门禁、代次 CAS 状态机、稳定散列路由）、调用、重演归因。
+  （建批门禁、代次 CAS 状态机、稳定散列路由）、自动止损（回执幂等入账、
+  窗口统计、单事务冻结+快照）、调用、重演归因。
 - `app.py`：HTTP 路由（JSON API + 服务端渲染页面）。
 - `seed.py`：幂等演示数据。
 - `tests/test_rollout.py`：放量机制端到端验证（同键稳定/按比例分流/并发升档/
-  冻结/撤销/复查复现/专项授权/HTTP 冒烟），`python3 -m unittest discover -s tests`。
+  冻结/撤销/复查复现/专项授权/HTTP 冒烟）。
+- `tests/test_guard.py`：自动止损端到端验证（重复回执/无关请求/阈值临界/并发触发/
+  迟到回执/人工恢复重置窗口/旧请求复核/窗口过期/HTTP 冒烟），
+  `python3 -m unittest discover -s tests`。

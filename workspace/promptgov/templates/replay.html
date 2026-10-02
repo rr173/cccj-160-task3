@@ -110,3 +110,50 @@
     </table>
   </div>
 </div>
+
+<div class="card" style="margin-top:16px">
+  <h2>效果回执（生产反馈 → 自动止损）</h2>
+  <p class="small">用 <span class="mono">request_id + feedback_id</span> 上报该请求的成功/失败；
+    同一 feedback_id 只入账一次。仅"本代次 + 命中候选 + 批次放量中"的回执计入止损统计，
+    其余（旧代次、无关请求、未命中候选）只留审计记录。</p>
+  {% if feedbacks %}
+  <table>
+    <thead><tr><th>时间</th><th>feedback_id</th><th>结论</th><th>处置</th><th>批次 / 代次</th><th>备注</th></tr></thead>
+    <tbody>
+    {% for f in feedbacks %}
+      <tr>
+        <td class="small">{{ f.created_at }}</td>
+        <td class="small mono">{{ f.feedback_id }}</td>
+        <td class="small">{% if f.outcome == 'failure' %}<span class="bad">failure</span>{% else %}<span class="ok">success</span>{% endif %}
+          {% if f.counted %}<span class="chip">入账</span>{% endif %}</td>
+        <td><span class="badge b-{{ f.disposition }}">{{ f.disposition }}</span></td>
+        <td class="small mono">{{ f.rollout_id }} {% if f.generation %}· 代次 {{ f.generation }}{% endif %}</td>
+        <td class="small">{{ f.note }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="mut">该请求暂无回执。</p>
+  {% endif %}
+  <form method="post" action="/ui/requests/{{ req.request_id }}/feedback">
+    <div class="grid g3" style="grid-template-columns:2fr 1fr 2fr auto">
+      <div>
+        <label>feedback_id（幂等键，重复提交不重复入账）</label>
+        <input name="feedback_id" required placeholder="fb-{{ req.request_id }}-001">
+      </div>
+      <div>
+        <label>结论</label>
+        <select name="outcome">
+          <option value="success">success</option>
+          <option value="failure">failure</option>
+        </select>
+      </div>
+      <div>
+        <label>备注（可选）</label>
+        <input name="note" placeholder="人工复核 / 客诉单号 ...">
+      </div>
+      <div style="align-self:end"><button>提交回执</button></div>
+    </div>
+  </form>
+</div>

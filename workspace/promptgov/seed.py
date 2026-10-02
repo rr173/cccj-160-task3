@@ -99,10 +99,17 @@ def run() -> None:
 
     # 分批放量演示：v2（已审核、权限未扩大）建立 20% 权重批次；
     # 两笔带 routing_key 的线上调用，固化命中构件/批次代次/参数指纹
-    services.create_rollout(FAMILY, v2["version_id"], 20, actor)
-    services.invoke(FAMILY, ONLINE_INPUTS, actor, routing_key="user-10086")
-    services.invoke(FAMILY, ONLINE_INPUTS, actor, routing_key="user-20431")
+    ro = services.create_rollout(FAMILY, v2["version_id"], 20, actor)
+    # 自动止损演示：为试投配置观察窗口/最小样本量/失败占比上限
+    services.set_rollout_guard(ro["rollout_id"], 900, 5, 0.4, actor)
+    r1 = services.invoke(FAMILY, ONLINE_INPUTS, actor, routing_key="user-10086")
+    r2 = services.invoke(FAMILY, ONLINE_INPUTS, actor, routing_key="user-20431")
+    # 命中候选的请求补一条成功回执，演示回执入账（未命中候选的只留审计）
+    for r in (r1, r2):
+        if r["rollout_id"]:
+            services.submit_feedback(r["request_id"], f"seed-fb-{r['request_id'][-6:]}",
+                                     "success", actor, "演示回执")
 
     conn.commit()
-    print("[seed] 演示数据就绪：family=%s 线上=v1，候选 v2（20%% 放量中）、v3（需工具权限审批）、"
-          "v4（弱模型证据）" % FAMILY)
+    print("[seed] 演示数据就绪：family=%s 线上=v1，候选 v2（20%% 放量中，已配止损）、"
+          "v3（需工具权限审批）、v4（弱模型证据）" % FAMILY)

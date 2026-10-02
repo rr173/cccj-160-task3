@@ -137,6 +137,53 @@ CREATE TABLE IF NOT EXISTS rollouts (
     updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- 自动止损配置：每个放量批次一条（upsert），作用于当前及之后代次的回执统计
+CREATE TABLE IF NOT EXISTS rollout_guards (
+    guard_id         TEXT PRIMARY KEY,
+    rollout_id       TEXT NOT NULL UNIQUE REFERENCES rollouts(rollout_id),
+    window_seconds   INTEGER NOT NULL,     -- 观察窗口（秒，滑动）
+    min_samples      INTEGER NOT NULL,     -- 最小样本量（窗口内入账回执数）
+    max_fail_ratio   REAL NOT NULL,        -- 失败占比上限 [0,1)，越过即触发
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    created_by       TEXT NOT NULL DEFAULT 'api',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 生产效果回执：feedback_id 幂等（只入账一次）；counted=1 才计入止损统计，
+-- 旧代次/无关请求/未命中候选的回执 counted=0，仅留审计记录，不触发状态变化
+CREATE TABLE IF NOT EXISTS feedback_receipts (
+    feedback_id      TEXT PRIMARY KEY,
+    request_id       TEXT NOT NULL,          -- 不回填外键：无关请求也允许留痕
+    family_id        TEXT,                   -- 请求已知时冗余其族，便于审计检索
+    rollout_id       TEXT,                   -- 请求命中时固化的批次（可能已是旧代次）
+    generation       INTEGER,                -- 请求命中时固化的批次代次
+    outcome          TEXT NOT NULL,          -- success / failure
+    counted          INTEGER NOT NULL DEFAULT 0,
+    disposition      TEXT NOT NULL,          -- counted / unknown_request / not_candidate /
+                                             -- stale_generation / rollout_inactive /
+                                             -- no_guard / guard_disabled / request_already_counted
+    note             TEXT NOT NULL DEFAULT '',
+    actor            TEXT NOT NULL DEFAULT 'api',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 止损触发快照：窗口统计 + 当时配置 + 触发回执，单事务内随冻结一并落库
+CREATE TABLE IF NOT EXISTS guard_events (
+    event_id         TEXT PRIMARY KEY,
+    rollout_id       TEXT NOT NULL REFERENCES rollouts(rollout_id),
+    generation       INTEGER NOT NULL,       -- 触发时（被冻结）的代次
+    trigger_feedback_id TEXT NOT NULL,       -- 越界的那张回执
+    window_seconds   INTEGER NOT NULL,
+    min_samples      INTEGER NOT NULL,
+    max_fail_ratio   REAL NOT NULL,
+    samples          INTEGER NOT NULL,
+    failures         INTEGER NOT NULL,
+    fail_ratio       REAL NOT NULL,
+    action           TEXT NOT NULL DEFAULT 'freeze',  -- 冻结试投，新流量导回基线
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- 重演报告
 CREATE TABLE IF NOT EXISTS replays (
     replay_id        TEXT PRIMARY KEY,
@@ -171,6 +218,10 @@ CREATE INDEX IF NOT EXISTS idx_eval_version ON eval_runs(version_id);
 CREATE INDEX IF NOT EXISTS idx_requests_version ON requests(version_id);
 CREATE INDEX IF NOT EXISTS idx_replays_request ON replays(request_id);
 CREATE INDEX IF NOT EXISTS idx_rollouts_family ON rollouts(family_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_rollout ON feedback_receipts(rollout_id, generation, counted);
+CREATE INDEX IF NOT EXISTS idx_feedback_request ON feedback_receipts(request_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_family ON feedback_receipts(family_id);
+CREATE INDEX IF NOT EXISTS idx_guard_events_rollout ON guard_events(rollout_id);
 """
 
 # 老库增量迁移：requests 的放量证据列（新库已由 _SCHEMA 建全）

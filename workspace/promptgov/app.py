@@ -46,6 +46,10 @@ color:var(--warn)}.b-evaluated{background:rgba(47,191,113,.12);color:var(--ok)}
 .b-frozen{background:rgba(79,140,255,.15);color:var(--acc);border:1px solid rgba(79,140,255,.4)}
 .b-completed{background:rgba(47,191,113,.15);color:var(--ok);border:1px solid rgba(47,191,113,.4)}
 .b-cancelled{background:#232c3f;color:#8a97ae}
+.b-counted{background:rgba(47,191,113,.15);color:var(--ok);border:1px solid rgba(47,191,113,.4)}
+.b-stale_generation,.b-not_candidate,.b-unknown_request,.b-no_guard,.b-guard_disabled{
+background:#232c3f;color:#8a97ae}
+.b-request_already_counted,.b-rollout_inactive{background:rgba(232,168,56,.15);color:var(--warn)}
 .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.mut{color:var(--mut)}
 input,select,textarea{width:100%;background:#0f1624;border:1px solid var(--line);color:var(--ink);
 border-radius:8px;padding:8px 10px;font:inherit;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
@@ -204,6 +208,9 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/families/([\w.-]+)/rollout", p)
         if method == "GET" and m:
             return self._page_rollout(m.group(1), q)
+        m = re.fullmatch(r"/families/([\w.-]+)/guard", p)
+        if method == "GET" and m:
+            return self._page_guard(m.group(1), q)
 
         # ------------------------------------------------ UI 表单动作
         if method == "POST" and re.fullmatch(r"/ui/families/[\w.-]+/versions", p):
@@ -224,6 +231,10 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and \
                 re.fullmatch(r"/ui/rollouts/[\w.-]+/(ramp|freeze|resume|complete|cancel)", p):
             return self._ui_rollout_action(p.split("/")[3], p.split("/")[-1])
+        if method == "POST" and re.fullmatch(r"/ui/rollouts/[\w.-]+/guard", p):
+            return self._ui_guard(p.split("/")[3])
+        if method == "POST" and re.fullmatch(r"/ui/requests/[\w.-]+/feedback", p):
+            return self._ui_feedback(p.split("/")[3])
         if method == "POST" and re.fullmatch(r"/ui/requests/[\w.-]+/replay", p):
             return self._ui_replay(p.split("/")[3])
         if method == "POST" and p == "/ui/families":
@@ -270,7 +281,7 @@ class Handler(BaseHTTPRequestHandler):
             b = _json_body(self)
             return self._json(services.create_rollout(
                 fid, b["candidate_version_id"], int(b.get("weight", 10)),
-                b.get("actor", "api")), 201)
+                b.get("actor", "api"), b.get("guard")), 201)
         m = re.fullmatch(r"/api/families/([\w.-]+)/(promote|rollback)", p)
         if method == "POST" and m:
             b = _json_body(self)
@@ -309,6 +320,31 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/rollouts/([\w.-]+)", p)
         if method == "GET" and m:
             return self._json(services.get_rollout(m.group(1)))
+        m = re.fullmatch(r"/api/rollouts/([\w.-]+)/guard", p)
+        if m:
+            rid = m.group(1)
+            if method == "GET":
+                return self._json(services.guard_status(rid))
+            if method == "POST":
+                b = _json_body(self)
+                return self._json(services.set_rollout_guard(
+                    rid, b["window_seconds"], b["min_samples"], b["max_fail_ratio"],
+                    b.get("actor", "api"), int(b.get("enabled", 1))), 201)
+        m = re.fullmatch(r"/api/rollouts/([\w.-]+)/guard/events", p)
+        if method == "GET" and m:
+            return self._json(services.list_guard_events(rollout_id=m.group(1)))
+        m = re.fullmatch(r"/api/rollouts/([\w.-]+)/feedback", p)
+        if method == "GET" and m:
+            return self._json(services.list_feedback(rollout_id=m.group(1)))
+        if method == "POST" and p == "/api/feedback":
+            b = _json_body(self)
+            res = services.submit_feedback(b["request_id"], b["feedback_id"],
+                                           b["outcome"], b.get("actor", "api"),
+                                           b.get("note", ""))
+            return self._json(res, 200 if res["duplicate"] else 201)
+        m = re.fullmatch(r"/api/feedback/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._json(services.get_feedback(m.group(1)))
         m = re.fullmatch(r"/api/rollouts/([\w.-]+)/(ramp|freeze|resume|complete|cancel)", p)
         if method == "POST" and m:
             b = _json_body(self)
@@ -484,6 +520,10 @@ class Handler(BaseHTTPRequestHandler):
 
         rows = [enrich(r) for r in rollouts]
         current = next((r for r in rows if r["open"]), None)
+        guard = guard_stats = None
+        if current:
+            st = services.guard_status(current["rollout_id"])
+            guard, guard_stats = st["guard"], st["stats"]
         candidates = [{"version_id": v["version_id"], "semver": v["semver"],
                        "status": v["status"], "short_hash": _short(v["content_hash"]),
                        "model_id": json.loads(v["model_params"]).get("_bound_model", "")}
@@ -497,8 +537,41 @@ class Handler(BaseHTTPRequestHandler):
                      "created_at": r["created_at"]} for r in requests]
         ctx = {"family": family, "current": current, "rollouts": rows,
                "candidates": candidates, "requests": req_rows,
+               "guard": guard, "guard_stats": guard_stats,
                "flash": self._flash(q)}
         self._html(page(f"{family['name']} · 放量批次", "rollout.html", ctx))
+
+    def _page_guard(self, fid, q):
+        self._is_page = True
+        family = services.get_family(fid)
+        versions = {v["version_id"]: v for v in services.list_versions(fid)}
+        current = services.current_rollout(fid)
+        current_view = guard = stats = None
+        if current:
+            st = services.guard_status(current["rollout_id"])
+            guard, stats = st["guard"], st["stats"]
+            cand = versions.get(current["candidate_version_id"])
+            base = versions.get(current["base_version_id"])
+            current_view = {**current,
+                            "candidate_semver": cand["semver"] if cand else "?",
+                            "base_semver": base["semver"] if base else "?",
+                            "is_ramping": current["status"] == "ramping",
+                            "is_frozen": current["status"] == "frozen"}
+        if guard:
+            guard = {**guard, "max_fail_ratio_pct": f"{guard['max_fail_ratio']:.0%}"}
+        if stats:
+            stats = {**stats, "ratio_pct": f"{stats['fail_ratio']:.1%}"}
+        events = services.list_guard_events(family_id=fid)
+        event_rows = [{**e, "fail_ratio_pct": f"{e['fail_ratio']:.1%}",
+                       "max_fail_ratio_pct": f"{e['max_fail_ratio']:.0%}"}
+                      for e in events]
+        receipts = [{"request_exists": r["disposition"] != "unknown_request", **r}
+                    for r in services.list_feedback(family_id=fid, limit=50)]
+        ctx = {"family": family, "current": current_view, "guard": guard,
+               "stats": stats, "events": event_rows, "receipts": receipts,
+               "enabled_checked": "checked" if (not guard or guard["enabled"]) else "",
+               "flash": self._flash(q)}
+        self._html(page(f"{family['name']} · 自动止损", "guard.html", ctx))
 
     def _page_replay(self, rid, q):
         self._is_page = True
@@ -518,6 +591,7 @@ class Handler(BaseHTTPRequestHandler):
                 rollout = services.get_rollout(req["rollout_id"])
             except services.NotFound:
                 rollout = None
+        feedbacks = services.list_feedback(request_id=rid)
         ctx = {"req": {"request_id": rid, "family_id": req["family_id"],
                        "family_name": family["name"], "version_id": req["version_id"],
                        "model_id": req["model_id"],
@@ -539,6 +613,7 @@ class Handler(BaseHTTPRequestHandler):
                        "created_at": req["created_at"]},
                "rollout": rollout,
                "versions": versions, "models": llm.list_models(),
+               "feedbacks": feedbacks,
                "replays": rpl_rows, "result": None, "flash": self._flash(q)}
         # 若带 ?rpl= 则展示该报告详情
         rpl_id = q.get("rpl", [None])[0]
@@ -634,6 +709,23 @@ class Handler(BaseHTTPRequestHandler):
         else:
             ro = services.cancel_rollout(rid, gen, actor)
         self._redirect(f"/families/{ro['family_id']}/rollout")
+
+    def _ui_guard(self, rid):
+        self._is_page = True
+        f = _form(self)
+        ro = services.get_rollout(rid)
+        services.set_rollout_guard(rid, f["window_seconds"], f["min_samples"],
+                                   f["max_fail_ratio"], f.get("actor", "web") or "web",
+                                   1 if f.get("enabled") else 0)
+        self._redirect(f"/families/{ro['family_id']}/guard")
+
+    def _ui_feedback(self, rid):
+        self._is_page = True
+        f = _form(self)
+        services.submit_feedback(rid, f["feedback_id"].strip(), f["outcome"],
+                                 f.get("actor", "web") or "web",
+                                 f.get("note", "").strip())
+        self._redirect(f"/requests/{rid}/replay")
 
     def _ui_replay(self, rid):
         self._is_page = True

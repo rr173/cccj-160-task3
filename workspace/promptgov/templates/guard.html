@@ -1,0 +1,136 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/families/{{ family.family_id }}/rollout">← 放量操作页</a> ·
+  业务方为一次试投设置<b>观察窗口</b>、<b>最小样本量</b>与<b>失败占比上限</b>；
+  生产回执按 <span class="mono">request_id + feedback_id</span> 上报成功/失败，
+  同一 <span class="mono">feedback_id</span> 只入账一次。
+  窗口内样本达标且失败占比<b>越过</b>上限时，系统在<b>单事务</b>内冻结试投、
+  把新流量导回基线并保存触发快照；旧代次与无关请求的回执只留审计记录，不触发状态变化。
+  人工恢复开启新代次并重置统计窗口，旧窗口与历史请求始终可复核。
+</div>
+
+{% if current %}
+<div class="card">
+  <h2>当前批次止损配置
+    {% if current.is_ramping %}<span class="badge b-ramping">ramping 放量中</span>{% endif %}
+    {% if current.is_frozen %}<span class="badge b-frozen">frozen 已冻结</span>{% endif %}
+  </h2>
+  <div class="kv">
+    <div>rollout_id</div><div class="mono">{{ current.rollout_id }}</div>
+    <div>候选 → 基线</div><div><b>v{{ current.candidate_semver }}</b> → v{{ current.base_semver }}
+      <span class="small mut">（触发后新流量导回基线构件）</span></div>
+    <div>批次代次</div><div class="mono">{{ current.generation }}</div>
+    {% if guard %}
+    <div>观察窗口</div><div><b>{{ guard.window_seconds }}s</b>（滑动窗口，按回执入账时间计）</div>
+    <div>最小样本量</div><div><b>{{ guard.min_samples }}</b></div>
+    <div>失败占比上限</div><div><b>{{ guard.max_fail_ratio_pct }}</b>（越过即触发）</div>
+    <div>启用状态</div><div>{% if guard.enabled %}<span class="badge b-active">enabled</span>{% else %}<span class="badge b-cancelled">disabled</span>{% endif %}</div>
+    {% else %}
+    <div>配置</div><div class="mut">未配置止损：回执只留审计记录，不计数、不触发。</div>
+    {% endif %}
+  </div>
+
+  <h3>{{ '更新止损配置' if guard else '配置自动止损' }}</h3>
+  <form method="post" action="/ui/rollouts/{{ current.rollout_id }}/guard">
+    <div class="grid g3">
+      <div>
+        <label>观察窗口（秒）</label>
+        <input name="window_seconds" type="number" min="1"
+               value="{{ guard.window_seconds if guard else 600 }}" required>
+      </div>
+      <div>
+        <label>最小样本量</label>
+        <input name="min_samples" type="number" min="1"
+               value="{{ guard.min_samples if guard else 5 }}" required>
+      </div>
+      <div>
+        <label>失败占比上限 [0,1)</label>
+        <input name="max_fail_ratio" type="number" step="0.01" min="0" max="0.99"
+               value="{{ guard.max_fail_ratio if guard else 0.4 }}" required>
+      </div>
+    </div>
+    <label style="margin-top:10px">
+      <input type="checkbox" name="enabled" style="width:auto" {{ enabled_checked }}> 启用止损
+    </label>
+    <div class="row" style="margin-top:8px"><button>保存配置</button></div>
+  </form>
+</div>
+
+{% if stats %}
+<div class="card">
+  <h2>当前窗口统计（代次 {{ current.generation }} · 滑动 {{ guard.window_seconds }}s）</h2>
+  <div class="axis">
+    <div>窗口样本<br><b style="font-size:18px">{{ stats.samples }}</b>
+      <br><span class="small">门槛 {{ guard.min_samples }}</span></div>
+    <div>失败<br><b style="font-size:18px" class="bad">{{ stats.failures }}</b></div>
+    <div>失败占比<br><b style="font-size:18px">{{ stats.ratio_pct }}</b>
+      <br><span class="small">上限 {{ guard.max_fail_ratio_pct }}</span></div>
+    <div>判定<br>
+      {% if stats.over_cap %}<span class="bad">已越界（触发冻结）</span>
+      {% elif stats.min_reached %}<span class="warn">样本达标 · 未越界</span>
+      {% else %}<span class="mut">样本未达门槛</span>{% endif %}</div>
+  </div>
+</div>
+{% endif %}
+{% else %}
+<div class="card">
+  <h2>当前无进行中批次</h2>
+  <p class="mut">没有 ramping/frozen 状态的放量批次，止损配置暂不可改；
+    历史触发快照与回执流水如下，仍可复核。</p>
+</div>
+{% endif %}
+
+<div class="grid g2" style="margin-top:16px">
+  <div class="card">
+    <h2>触发历史（快照不可变）</h2>
+    {% if events %}
+    <table>
+      <thead><tr><th>时间</th><th>批次 / 代次</th><th>窗口统计</th><th>当时配置</th><th>触发回执</th><th>动作</th></tr></thead>
+      <tbody>
+      {% for e in events %}
+        <tr>
+          <td class="small">{{ e.created_at }}</td>
+          <td class="small mono">{{ e.rollout_id }}<br>代次 {{ e.generation }}</td>
+          <td class="small"><b class="bad">{{ e.failures }}</b> / {{ e.samples }} 失败
+            （{{ e.fail_ratio_pct }}）</td>
+          <td class="small">窗口 {{ e.window_seconds }}s · 样本≥{{ e.min_samples }} ·
+            上限 {{ e.max_fail_ratio_pct }}</td>
+          <td class="small mono">{{ e.trigger_feedback_id }}</td>
+          <td><span class="badge b-frozen">{{ e.action }} 冻结回基线</span></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="mut">尚无止损触发记录。</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>回执流水（含仅审计的入账）</h2>
+    {% if receipts %}
+    <table>
+      <thead><tr><th>时间</th><th>feedback_id</th><th>request</th><th>结论</th><th>处置</th><th>代次</th></tr></thead>
+      <tbody>
+      {% for r in receipts %}
+        <tr>
+          <td class="small">{{ r.created_at }}</td>
+          <td class="small mono">{{ r.feedback_id }}</td>
+          <td class="small mono">
+            {% if r.request_exists %}<a href="/requests/{{ r.request_id }}/replay">{{ r.request_id }}</a>
+            {% else %}{{ r.request_id }}{% endif %}</td>
+          <td class="small">{% if r.outcome == 'failure' %}<span class="bad">failure</span>{% else %}<span class="ok">success</span>{% endif %}
+            {% if r.counted %}<span class="chip">入账</span>{% endif %}</td>
+          <td><span class="badge b-{{ r.disposition }}">{{ r.disposition }}</span></td>
+          <td class="small mono">{{ r.generation }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="mut">尚无回执。用 <span class="mono">POST /api/feedback</span> 携带
+      <span class="mono">request_id + feedback_id + outcome</span> 上报。</p>
+    {% endif %}
+  </div>
+</div>
